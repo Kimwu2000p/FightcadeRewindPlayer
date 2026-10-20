@@ -1,4 +1,4 @@
-﻿# FightcadeRewindPlayer âªâ©
+# FightcadeRewindPlayer âªâ©
 
 **FightcadeRewindPlayer** æ˜¯ä¸€æ¬¾å°ˆç‚º Fightcade / FBNeo å›žæ”¾æ‰“é€ çš„ç„¡ç¸«æ™‚å…‰å€’æµèˆ‡é€²åº¦è·³è½‰æŽ§åˆ¶æ’­æ”¾å™¨ã€‚
 
