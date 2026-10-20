@@ -20,12 +20,14 @@ ggpo_synchronize_input
 lua_census_verify
 lua_get_input_frame
 lua_get_live_input_state
+lua_get_scores
 lua_poll_gui_cmd
 lua_set_bisection_group
 lua_set_continuous_purify
 lua_set_counter_writeback
 lua_set_paused
 lua_set_rewind_frame
+lua_set_scores
 lua_snapshot_restore_inputs
 lua_snapshot_save_inputs
 lua_update_gui_state

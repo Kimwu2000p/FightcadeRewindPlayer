@@ -2374,6 +2374,61 @@ __declspec(dllexport) int lua_update_gui_state(void* L) {
 // ----------------------------------------------------------------------------
 // 初始化模組目錄與寫入啟動日誌
 // ----------------------------------------------------------------------------
+
+// ============================================================================
+// 自由對戰 / 排位 比分時光倒流同步 API (Score Timeline Synchronization)
+// ============================================================================
+typedef void (__fastcall *pfn_FBNeo_SetScores)(int p1, int p2);
+
+// 讀取當前 FBNeo 檢測器比分整數 (p1, p2)
+__declspec(dllexport) int lua_get_scores(void* L) {
+    if (!p_lua_pushinteger) InitRealDll();
+    if (!p_lua_pushinteger || !L) return 0;
+
+    int p1 = 0;
+    int p2 = 0;
+
+    if (!g_exe_base) DetectExeBase();
+    if (g_exe_base && g_exe_whitelist_matched) {
+        int* pScoreP1 = (int*)(g_exe_base + 0x02D83210);
+        int* pScoreP2 = (int*)(g_exe_base + 0x02D83214);
+
+        if (!IsBadReadPtr(pScoreP1, sizeof(int)) && !IsBadReadPtr(pScoreP2, sizeof(int))) {
+            p1 = *pScoreP1;
+            p2 = *pScoreP2;
+        }
+    }
+
+    p_lua_pushinteger(L, p1);
+    p_lua_pushinteger(L, p2);
+    return 2;
+}
+
+// 設定當前 FBNeo 檢測器比分並立即刷新 UI 浮層
+__declspec(dllexport) int lua_set_scores(void* L) {
+    if (!p_lua_tointeger) InitRealDll();
+    if (!p_lua_tointeger || !L) return 0;
+
+    int p1 = (int)p_lua_tointeger(L, 1);
+    int p2 = (int)p_lua_tointeger(L, 2);
+
+    if (!g_exe_base) DetectExeBase();
+    if (g_exe_base && g_exe_whitelist_matched) {
+        int* pScoreP1 = (int*)(g_exe_base + 0x02D83210);
+        int* pScoreP2 = (int*)(g_exe_base + 0x02D83214);
+        pfn_FBNeo_SetScores pSetScores = (pfn_FBNeo_SetScores)(g_exe_base + 0x0020B0C0);
+
+        if (!IsBadWritePtr(pScoreP1, sizeof(int)) && !IsBadWritePtr(pScoreP2, sizeof(int))) {
+            *pScoreP1 = p1;
+            *pScoreP2 = p2;
+            if (pSetScores && !IsBadCodePtr((FARPROC)pSetScores)) {
+                pSetScores(p1, p2);
+            }
+        }
+    }
+    return 0;
+}
+
 static void InitModuleDir(HINSTANCE hinstDLL) {
     g_my_dll_base = (uintptr_t)hinstDLL;
     DetectExeBase();

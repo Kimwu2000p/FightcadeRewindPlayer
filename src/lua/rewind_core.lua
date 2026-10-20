@@ -136,6 +136,8 @@ local f_restore_inputs = nil
 local f_poll_cmd       = nil
 local f_update_state   = nil
 local f_set_paused     = nil
+local f_get_scores     = nil
+local f_set_scores     = nil
 local bound_dll_path   = "NONE"
 
 pcall(function()
@@ -161,6 +163,8 @@ pcall(function()
                 f_restore_inputs = package.loadlib(dll_p, "lua_snapshot_restore_inputs")
                 f_poll_cmd       = package.loadlib(dll_p, "lua_poll_gui_cmd")
                 f_update_state   = package.loadlib(dll_p, "lua_update_gui_state")
+                f_get_scores     = package.loadlib(dll_p, "lua_get_scores")
+                f_set_scores     = package.loadlib(dll_p, "lua_set_scores")
                 bound_dll_path   = dll_p
                 break
             end
@@ -170,6 +174,42 @@ end)
 
 log_msg(string.format("啟動完成 | platform=%s | script_dir=%s | bound_dll=%s | get=%s set=%s",
     PLATFORM, script_dir, bound_dll_path, tostring(f_get_frame ~= nil), tostring(f_set_rewind ~= nil)))
+
+-- ============================================================================
+-- 比分歷史時間軸管理器 (Score Timeline Manager)
+-- 保證跳轉 (Seek/PCT) 時頂部比分板與該幀歷史狀態 100% 同步
+-- ============================================================================
+local score_timeline = {}
+local last_recorded_p1 = -1
+local last_recorded_p2 = -1
+
+local function sample_and_record_scores(f_num)
+    if not f_get_scores then return end
+    local ok, p1, p2 = pcall(f_get_scores)
+    if not ok or not p1 or not p2 then return end
+
+    if #score_timeline == 0 or p1 ~= last_recorded_p1 or p2 ~= last_recorded_p2 then
+        table.insert(score_timeline, { frame = f_num, p1 = p1, p2 = p2 })
+        last_recorded_p1 = p1
+        last_recorded_p2 = p2
+        log_msg(string.format("SCORE_TIMELINE_RECORD: frame=%d -> %d VS %d (total_pts=%d)", f_num, p1, p2, #score_timeline))
+    end
+end
+
+local function sync_score_at_frame(f_num)
+    if not f_set_scores or #score_timeline == 0 then return end
+    local best_p1 = score_timeline[1].p1
+    local best_p2 = score_timeline[1].p2
+    for i = #score_timeline, 1, -1 do
+        if score_timeline[i].frame <= f_num then
+            best_p1 = score_timeline[i].p1
+            best_p2 = score_timeline[i].p2
+            break
+        end
+    end
+    pcall(function() f_set_scores(best_p1, best_p2) end)
+    log_msg(string.format("SCORE_TIMELINE_SYNC: frame=%d -> Restored %d VS %d", f_num, best_p1, best_p2))
+end
 
 -- 讀取 C 端底層狀態 (play_frame, record_frame, c_eof)
 local function read_c_status()
@@ -425,6 +465,7 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
             pause_after_seek = false
             pcall(function() emu.speedmode("normal") end)
             eof_grace_frames = 0
+            sync_score_at_frame(af)
             sync_gui_state()
             return
         end
@@ -440,6 +481,7 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
                 local load_ok, _ = raw_load_slot(best_s)
                 if load_ok then
                     cur_frame = best_f
+                    sync_score_at_frame(best_f)
                     -- 若為百分比大跳轉或已極接近目標，直接從該乾淨快照以 normal 速度播放，零 Turbo 誤差！
                     if is_pct_jump or (dest_frame - best_f <= BASE_STRIDE) then
                         target_frame     = best_f
@@ -507,6 +549,7 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
     pause_after_seek = false
     pcall(function() emu.speedmode("normal") end)
     eof_grace_frames = 0
+    sync_score_at_frame(best_f)
 
     sync_gui_state()
 end
@@ -734,6 +777,9 @@ local function main_frame_after()
     -- 2. 在整幀模擬與中斷完全安定後，優先記錄乾淨快照 (含第 30 幀開局錨點 Slot 1)
     if not is_paused and not reached_eof and c_starving == 0 then
         record_snapshot_at_frame(cur_frame)
+        if cur_frame >= max_seen_frame then
+            sample_and_record_scores(cur_frame)
+        end
     end
 
     -- 3. 讀取並處理 GUI 遙控指令 (在 registerafter 內先設 delta=0 再 load，確保下一幀 ggpo_synchronize_input 100% 精準對位)
@@ -761,6 +807,7 @@ local function main_frame_after()
             is_fast_forwarding = false
             pcall(function() emu.speedmode("normal") end)
             engine_state = STATE_PLAYBACK
+            sync_score_at_frame(cur_frame)
 
             if hit_eof then
                 eof_grace_frames = 3 -- 3 幀 normal 速度渲染最終勝利畫面
