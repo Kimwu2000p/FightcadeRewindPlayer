@@ -1,5 +1,5 @@
 -- ============================================================================
--- FightcadeRewindPlayer v23 - rewind_core.lua 核心引擎 (黃金同步與 64 槽位安全版)
+-- FightcadeRewindPlayer v1.0 - rewind_core.lua 核心引擎 (黃金同步與 64 槽位安全版)
 -- 關鍵修正：
 -- 1. 嚴格限制記憶體快照槽位在 Slot 1..42 (徹底避開 FBNeo save_mem 模數 64 回繞覆寫 Slot 1 的 Bug)
 -- 2. 開局錨點 Slot 1 (0 vs 0) 具備記憶體槽位 + 實體檔案 (anchor_0v0.fs) 雙重雜湊校驗保護
@@ -79,7 +79,7 @@ local function log_msg(msg)
     pcall(function()
         local f = io.open(debug_log_path, "a")
         if f then
-            f:write(string.format("[%s] [v23] %s\n", os.date("%Y-%m-%d %H:%M:%S"), msg))
+            f:write(string.format("[%s] [v1.0] %s\n", os.date("%Y-%m-%d %H:%M:%S"), msg))
             f:close()
         end
     end)
