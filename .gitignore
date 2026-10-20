@@ -1,0 +1,21 @@
+﻿# Binaries and temp files
+*.tmp
+*.log
+*.bak
+*.sav
+*.fs
+*.nv
+.backup/
+
+# Fightcade runtime & ROMs (Never commit game files!)
+roms/
+*.zip
+*.7z
+Fightcade/
+Fightcade-win32-latest/
+emulator/
+
+# OS specific
+Thumbs.db
+Desktop.ini
+.DS_Store
