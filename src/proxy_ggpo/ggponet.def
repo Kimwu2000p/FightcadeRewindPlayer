@@ -21,7 +21,9 @@ lua_census_verify
 lua_get_input_frame
 lua_get_live_input_state
 lua_get_scores
+lua_is_turbo_rec
 lua_poll_gui_cmd
+lua_set_audio_mute
 lua_set_bisection_group
 lua_set_continuous_purify
 lua_set_counter_writeback

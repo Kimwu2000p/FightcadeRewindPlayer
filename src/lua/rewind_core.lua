@@ -1,5 +1,5 @@
 -- ============================================================================
--- FightcadeRewindPlayer v1.0 - rewind_core.lua 核心引擎 (黃金同步與 64 槽位安全版)
+-- FightcadeRewindPlayer v1.1 - rewind_core.lua 核心引擎 (黃金同步與 64 槽位安全極速版)
 -- 關鍵修正：
 -- 1. 嚴格限制記憶體快照槽位在 Slot 1..42 (徹底避開 FBNeo save_mem 模數 64 回繞覆寫 Slot 1 的 Bug)
 -- 2. 開局錨點 Slot 1 (0 vs 0) 具備記憶體槽位 + 實體檔案 (anchor_0v0.fs) 雙重雜湊校驗保護
@@ -46,6 +46,7 @@ local pause_after_seek   = false
 local eof_grace_frames   = 0     -- 跳轉或撞尾後強制以 normal 速度渲染 2 幀，確保 DirectX 完整刷出畫面
 local pending_pct        = nil   -- 記錄尚未見底時點擊的目標百分比，用於撞尾自動回彈 (Snap-Back)
 local is_fast_forwarding = false -- 持續快轉旗標
+local was_turbo_recording = false -- 極速快錄狀態跟蹤
 local last_seen_fc       = -1    -- 單幀防重入保護
 local freeze_tick        = 0
 
@@ -79,11 +80,24 @@ local function log_msg(msg)
     pcall(function()
         local f = io.open(debug_log_path, "a")
         if f then
-            f:write(string.format("[%s] [v1.0] %s\n", os.date("%Y-%m-%d %H:%M:%S"), msg))
+            f:write(string.format("[%s] [v1.1] %s\n", os.date("%Y-%m-%d %H:%M:%S"), msg))
             f:close()
         end
     end)
 end
+
+pcall(function()
+    log_msg("=== FBNEO LUA ENVIRONMENT AUDIT ===")
+    if emu then
+        for k, v in pairs(emu) do log_msg("EMU_API: " .. tostring(k)) end
+    end
+    if sound then
+        for k, v in pairs(sound) do log_msg("SOUND_API: " .. tostring(k)) end
+    end
+    if audio then
+        for k, v in pairs(audio) do log_msg("AUDIO_API: " .. tostring(k)) end
+    end
+end)
 
 -- 基板硬體架構自動偵測 (用於計算 Work RAM 校驗雜湊)
 local PLATFORM  = "NEOGEO"
@@ -165,6 +179,8 @@ pcall(function()
                 f_update_state   = package.loadlib(dll_p, "lua_update_gui_state")
                 f_get_scores     = package.loadlib(dll_p, "lua_get_scores")
                 f_set_scores     = package.loadlib(dll_p, "lua_set_scores")
+                f_set_audio_mute = package.loadlib(dll_p, "lua_set_audio_mute")
+                f_is_turbo_rec   = package.loadlib(dll_p, "lua_is_turbo_rec")
                 bound_dll_path   = dll_p
                 break
             end
@@ -174,6 +190,22 @@ end)
 
 log_msg(string.format("啟動完成 | platform=%s | script_dir=%s | bound_dll=%s | get=%s set=%s",
     PLATFORM, script_dir, bound_dll_path, tostring(f_get_frame ~= nil), tostring(f_set_rewind ~= nil)))
+
+-- ============================================================================
+-- 原生進程內音效管理 (In-Process Native Audio Manager)
+-- 零驅動相依、零跨進程枚舉、零註冊表殘留，極速追趕 (Turbo/Seek/Fast-Forward) 與暫停時
+-- 即時跳過 DirectSound/WASAPI 合成，杜絕爆音尖叫，切回 1x 正常播放時即時恢復！
+-- ============================================================================
+local current_mute_state = -1
+
+local function set_audio_mute(mute)
+    if mute ~= current_mute_state then
+        current_mute_state = mute
+        if f_set_audio_mute then
+            pcall(function() f_set_audio_mute(mute) end)
+        end
+    end
+end
 
 -- ============================================================================
 -- 比分歷史時間軸管理器 (Score Timeline Manager)
@@ -233,7 +265,7 @@ local function read_c_status()
 end
 
 -- 同步狀態至 C 端與 ipc_state.txt (雙通道保底供 GUI 即時讀取)
-local function sync_gui_state()
+local function sync_gui_state(force_disk_flush)
     local c_play, c_rec, c_eof = read_c_status()
     local total_f = math.max(max_seen_frame, c_rec or 0)
     local is_eof_unlocked = (reached_eof or (c_eof == 1)) and 1 or 0
@@ -247,20 +279,33 @@ local function sync_gui_state()
         st_code = STATE_JIT_SEEK   -- 2 (快轉中，絕不誤報為 3 EOF！)
     end
 
-    if f_update_state then
-        pcall(function()
-            f_update_state(cur_frame, total_f, is_eof_unlocked, st_code, target_frame)
-        end)
-    end
+    -- 原生進程內音效管理：僅在 normal 1x 播放 (st_code == STATE_PLAYBACK) 時發聲，
+    -- 在 Turbo/Seek、Fast Forward、Pause 或定格時，進程內即時跳過音效合成！
+    local should_mute = (st_code ~= STATE_PLAYBACK) and 1 or 0
+    set_audio_mute(should_mute)
 
-    pcall(function()
-        local f = io.open(ipc_state_path, "w")
-        if f then
-            f:write(string.format("%d %d %d %d %d\n",
-                cur_frame, total_f, is_eof_unlocked, st_code, target_frame))
-            f:close()
+    if f_update_state then
+        local scr_w = (emu.screenwidth and emu.screenwidth()) or 0
+        local scr_h = (emu.screenheight and emu.screenheight()) or 0
+        local fl_flag = force_disk_flush and 1 or 0
+        pcall(function()
+            f_update_state(cur_frame, total_f, is_eof_unlocked, st_code, target_frame, scr_w, scr_h, fl_flag)
+        end)
+    else
+        -- 僅在 C 端 f_update_state 未綁定時，由 Lua 備援寫入 ipc_state.txt
+        local is_probing = (engine_state == STATE_JIT_SEEK or is_fast_forwarding)
+        local need_write_disk = force_disk_flush or (not is_probing) or (cur_frame % 240 == 0)
+        if need_write_disk then
+            pcall(function()
+                local f = io.open(ipc_state_path, "w")
+                if f then
+                    f:write(string.format("%d %d %d %d %d\n",
+                        cur_frame, total_f, is_eof_unlocked, st_code, target_frame))
+                    f:close()
+                end
+            end)
         end
-    end)
+    end
 end
 
 -- ============================================================================
@@ -290,7 +335,16 @@ local function raw_save_slot(slot)
         ok, err = pcall(function() savestate.save(slot_objs[slot]) end)
     end
     if ok then
-        slot_hashes[slot] = ram_hash()
+        -- 【RAM Hash 旁路優化】：
+        -- 開局錨點 (Slot 1) 永遠執行完整雙字節 Adler32 雜湊保護；
+        -- 僅在探底狂奔期間 (JIT_SEEK / FFWD) 暫停其他槽位的 Work RAM 雜湊運算，立省每秒 14 次 CPU 迴圈！
+        local is_probing = (engine_state == STATE_JIT_SEEK or is_fast_forwarding)
+        if slot == ANCHOR_SLOT or not is_probing then
+            slot_hashes[slot] = ram_hash(slot == ANCHOR_SLOT)
+        else
+            slot_hashes[slot] = 0
+        end
+
         if slot == ANCHOR_SLOT and savestate and savestate.save and anchor_file_obj then
             pcall(function() savestate.save(anchor_file_obj) end)
         end
@@ -302,7 +356,7 @@ local function raw_save_slot(slot)
 end
 
 local function raw_load_slot(slot)
-    local before_h = ram_hash()
+    local before_h = ram_hash(slot == ANCHOR_SLOT)
     local ok, err = false, nil
 
     -- 若載入開局錨點 Slot 1，先載入記憶體槽位並核驗 Hash；若受損則立即由獨立檔案快照救援
@@ -364,7 +418,7 @@ local function acquire_global_slot()
     return freed_slot or GLOBAL_MIN_SLOT
 end
 
-local function record_snapshot_at_frame(f_num)
+local function record_snapshot_at_frame(f_num, c_rec_in, c_eof_in)
     if f_num <= 0 then return end
 
     -- 【防污染鐵閘】：歷史回放期間 (cur_frame < max_seen_frame) 絕對禁止寫入快照！
@@ -380,8 +434,27 @@ local function record_snapshot_at_frame(f_num)
         return
     end
 
-    -- B. 每滿 180 幀 (3 秒) 檢查一次
-    if f_num % BASE_STRIDE ~= 0 then return end
+    -- 【極速短路】：所有快照步幅 (60/180/360) 皆為 60 之倍數，非 60 倍數幀 0 成本直接返回！
+    if f_num % 60 ~= 0 then return end
+
+    -- B. 探底階段自適應步幅 (Adaptive Striding)
+    local is_probing = (engine_state == STATE_JIT_SEEK or is_fast_forwarding)
+    local effective_base_stride = BASE_STRIDE -- 預設 180 (3 秒)
+    
+    if is_probing then
+        local c_rec = c_rec_in or max_seen_frame
+        local c_eof = c_eof_in or 0
+        local distance_to_eof = (c_eof == 1 and c_rec > 100) and (c_rec - f_num) or 99999
+        if distance_to_eof <= 300 then
+            -- 決勝衝刺圈 (最後 5 秒)：步幅縮小至 60 幀 (1 秒)，確保結尾 K.O. 畫面精度
+            effective_base_stride = 60
+        else
+            -- 狂奔階段：步幅放寬至 360 幀 (6 秒)，減少 50% 快照寫入負擔
+            effective_base_stride = 360
+        end
+    end
+
+    if f_num % effective_base_stride ~= 0 then return end
 
     -- 若該幀已存在於槽位中，跳過不重複存
     for s = 1, LOCAL_MAX_SLOT do
@@ -434,24 +507,25 @@ end
 local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
     local c_play, c_rec, c_eof = read_c_status()
 
-    -- 防幽靈幀截斷：若已知真實結尾，目標幀不可超過 c_rec - 5
     if c_eof == 1 and c_rec > 100 and dest_frame >= c_rec - 5 then
         dest_frame = c_rec - 5
     end
     if dest_frame < 0 then dest_frame = 0 end
     if dest_frame > MAX_CAPACITY_FRAMES then dest_frame = MAX_CAPACITY_FRAMES end
 
-    -- 無論當前是否播畢定格，立即無條件破除所有定格鎖與暫停狀態
+    -- 記錄進入前是否處於暫停狀態 (用於消除暫停期間 68000 CPU 偷跑 1 幀造成的 1-Frame Desync)
+    local was_paused   = is_paused
     reached_eof        = false
     is_paused          = false
     pause_after_seek   = false
     is_fast_forwarding = false
     eof_grace_frames   = 0
     freeze_tick        = 0
+    last_seen_fc       = -1 -- DEADLOCK_FIX: 重設幀計數防止主循環短路攔截
     pcall(function() emu.speedmode("normal") end)
     if f_set_paused then pcall(function() f_set_paused(0) end) end
 
-    -- 【情況 A】：回到開局 (dest_frame <= 60) -> 直接載入 Slot 1 開局錨點 (0 vs 0)，零追趕！
+    -- 分支 A: 回到開局 (dest_frame <= 60) -> 直接載入 Slot 1 錨點 (0 vs 0)
     if dest_frame <= 60 and slot_frames[ANCHOR_SLOT] ~= -1 then
         local af = slot_frames[ANCHOR_SLOT]
         if f_set_rewind then pcall(function() f_set_rewind(af, 0) end) end
@@ -466,14 +540,14 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
             pcall(function() emu.speedmode("normal") end)
             eof_grace_frames = 0
             sync_score_at_frame(af)
-            sync_gui_state()
+            sync_gui_state(true)
             return
         end
     end
 
-    -- 【情況 B】：若目標幀在當前進度之後 (往未來推進)
+    -- 分支 B: 向前跳轉 (dest_frame > cur_frame，例如 +1幀、+3秒、+10秒、快進30秒、百分比向後跳)
     if dest_frame > cur_frame then
-        -- B1. 若目標幀已在開荒過的歷史中 (dest_frame <= max_seen_frame)
+        -- B1. 目標在已探索範圍內 (dest_frame <= max_seen_frame)
         if dest_frame <= max_seen_frame then
             local best_f, best_s = find_best_snapshot(dest_frame)
             if best_s and best_f > cur_frame then
@@ -482,7 +556,6 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
                 if load_ok then
                     cur_frame = best_f
                     sync_score_at_frame(best_f)
-                    -- 若為百分比大跳轉或已極接近目標，直接從該乾淨快照以 normal 速度播放，零 Turbo 誤差！
                     if is_pct_jump or (dest_frame - best_f <= BASE_STRIDE) then
                         target_frame     = best_f
                         engine_state     = STATE_PLAYBACK
@@ -491,21 +564,26 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
                         pause_after_seek = false
                         pcall(function() emu.speedmode("normal") end)
                         eof_grace_frames = 0
-                        sync_gui_state()
+                        sync_gui_state(true)
                         return
                     end
                 end
+            else
+                -- 【全按鈕防 Desync 核心】：若未載入更新快照且原本處於暫停，必須先載入 SLOT_PAUSE 消除 CPU 偷跑的 1 幀！
+                if f_set_rewind then pcall(function() f_set_rewind(cur_frame, 0) end) end
+                if was_paused then
+                    raw_load_slot(SLOT_PAUSE)
+                end
             end
-            -- 若 best_f <= cur_frame (例如剛抽稀過、兩格距離較遠時的 +5s 微調)，直接從當前位置推進至 dest_frame
             target_frame     = dest_frame
             engine_state     = STATE_JIT_SEEK
             pause_after_seek = keep_paused and true or false
             pcall(function() emu.speedmode("turbo") end)
-            sync_gui_state()
+            sync_gui_state(true)
             return
         end
 
-        -- B2. 若目標幀超出已看過的範圍 (探索未知未來)：先跳到最遠乾淨快照，再以 Turbo 推進串流
+        -- B2. 目標超出已探索範圍 (向未知未來探索)
         local best_f, best_s = find_best_snapshot(max_seen_frame)
         if best_s and best_f > cur_frame then
             if f_set_rewind then pcall(function() f_set_rewind(best_f, 0) end) end
@@ -513,21 +591,26 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
             if load_ok then
                 cur_frame = best_f
             end
+        else
+            -- 【全按鈕防 Desync 核心】：在最新幀從暫停直接向前快進時，先載入 SLOT_PAUSE 消除 CPU 偷跑的 1 幀！
+            if f_set_rewind then pcall(function() f_set_rewind(cur_frame, 0) end) end
+            if was_paused then
+                raw_load_slot(SLOT_PAUSE)
+            end
         end
 
         target_frame     = dest_frame
         engine_state     = STATE_JIT_SEEK
         pause_after_seek = keep_paused and true or false
         pcall(function() emu.speedmode("turbo") end)
-        sync_gui_state()
+        sync_gui_state(true)
         return
     end
 
-    -- 【情況 C】：若目標幀在當前進度之前 (倒帶回歷史)
-    -- 【100% 黃金同步】：先設播放頭 f_set_rewind(best_f, 0)，再載入快照 raw_load_slot(best_slot)！
+    -- 分支 C: 向後倒帶或原地定位 (dest_frame <= cur_frame)
     local best_f, best_slot = find_best_snapshot(dest_frame)
     if not best_slot or best_f < 0 then
-        log_msg("SEEK_ERR: 找不到有效歷史快照 dest=" .. tostring(dest_frame))
+        log_msg("SEEK_ERR: 找不到可用快照 dest=" .. tostring(dest_frame))
         return
     end
 
@@ -537,29 +620,43 @@ local function seek_to_frame(dest_frame, keep_paused, is_pct_jump)
         best_slot, best_f, dest_frame, tostring(load_ok), tostring(load_err)))
 
     if not load_ok then
-        log_msg("SEEK_ABORT: 底層載入失敗！")
+        log_msg("SEEK_ABORT: 載入快照失敗！")
         return
     end
 
     cur_frame        = best_f
-    target_frame     = best_f
-    engine_state     = STATE_PLAYBACK
-    is_paused        = false
+    if dest_frame > best_f then
+        target_frame     = dest_frame
+        engine_state     = STATE_JIT_SEEK
+        pause_after_seek = keep_paused and true or false
+        pcall(function() emu.speedmode("turbo") end)
+    else
+        target_frame     = best_f
+        if keep_paused then
+            engine_state     = STATE_PLAYBACK
+            is_paused        = true
+            pause_after_seek = true
+            pcall(function() emu.pause() end)
+        else
+            engine_state     = STATE_PLAYBACK
+            is_paused        = false
+            pause_after_seek = false
+            pcall(function() emu.speedmode("normal") end)
+        end
+    end
     reached_eof      = false
-    pause_after_seek = false
-    pcall(function() emu.speedmode("normal") end)
     eof_grace_frames = 0
-    sync_score_at_frame(best_f)
+    sync_score_at_frame(cur_frame)
 
-    sync_gui_state()
+    sync_gui_state(true)
 end
 
--- 讀取外部 GUI 控制指令 (雙通道保底)
+-- 雙通道輪詢 GUI 指令 (記憶體優先 + 檔案備援)
 local function poll_command_dual()
     if f_poll_cmd then
         local ok, c_code, c_val = pcall(f_poll_cmd)
-        if ok and c_code and c_code ~= 0 then
-            return c_code, (c_val or 0)
+        if ok then
+            return (c_code or 0), (c_val or 0)
         end
     end
 
@@ -593,20 +690,21 @@ local function poll_command_dual()
                     cmd_code = 4
                     cmd_val  = tonumber(s_pct) or 0
                 end
-                if cmd_code ~= 0 then
-                    local fw = io.open(ipc_cmd_path, "w")
-                    if fw then fw:close() end
-                end
+                local fw = io.open(ipc_cmd_path, "w")
+                if fw then fw:close() end
             end
         end
     end)
     return cmd_code, cmd_val
 end
 
--- 處理 GUI 遙控指令
+-- 處理 GUI 導播指令
 local function process_gui_commands()
     local cmd_code, cmd_val = poll_command_dual()
     if not cmd_code or cmd_code == 0 then return false end
+
+    -- 【全域防死結保險】：只要收到任何 GUI 指令，立即重設 last_seen_fc = -1，確保下一幀 100% 推進
+    last_seen_fc = -1
 
     log_msg(string.format("收到 GUI 指令: code=%d val=%d (cur_frame=%d max_seen=%d)", cmd_code, cmd_val, cur_frame, max_seen_frame))
 
@@ -620,15 +718,22 @@ local function process_gui_commands()
         is_fast_forwarding = false
         local c_play, c_rec, c_eof = read_c_status()
         if reached_eof or (c_eof == 1 and c_rec > 500 and cur_frame >= c_rec - 5) then
-            -- 若已播畢定格於比賽結尾，點擊播放即自動從頭開始重播 (0%)
+            -- 全場播畢定格時按 PAUSE：自動回到開局 (0%)
             seek_to_frame(0, false, true)
             return true
         elseif is_paused then
-            is_paused = false
-            engine_state = STATE_PLAYBACK
+            -- 【無縫零幀差恢復播放】：直接載入 SLOT_PAUSE 並釋放暫停鎖，0 毫秒原地繼續 1x 播放！
+            is_paused        = false
+            pause_after_seek = false
+            eof_grace_frames = 0
+            freeze_tick      = 0
+            engine_state     = STATE_PLAYBACK
             pcall(function() emu.speedmode("normal") end)
             if f_set_paused then pcall(function() f_set_paused(0) end) end
-            seek_to_frame(cur_frame, false, false)
+            if f_set_rewind then pcall(function() f_set_rewind(cur_frame, 0) end) end
+            raw_load_slot(SLOT_PAUSE)
+            sync_score_at_frame(cur_frame)
+            sync_gui_state(true)
             return true
         elseif engine_state == STATE_JIT_SEEK then
             pcall(function() emu.speedmode("normal") end)
@@ -643,14 +748,14 @@ local function process_gui_commands()
             if f_set_paused then pcall(function() f_set_paused(1) end) end
             if f_set_rewind then pcall(function() f_set_rewind(cur_frame, 0) end) end
         end
-        sync_gui_state()
+        sync_gui_state(true)
         return true
     elseif cmd_code == 3 then
         -- DELTA <frames>
         is_fast_forwarding = false
         local c_play, c_rec, c_eof = read_c_status()
         if cmd_val > 0 and (reached_eof or (c_eof == 1 and c_rec > 500 and cur_frame >= c_rec - 5)) then
-            sync_gui_state()
+            sync_gui_state(true)
             return true
         end
 
@@ -662,7 +767,6 @@ local function process_gui_commands()
 
         local dest = base_origin + cmd_val
 
-        -- 【邊界鐵壁防護】：嚴禁連續快進衝出比賽範圍
         if c_eof == 1 and c_rec > 100 then
             if dest >= c_rec - 5 then dest = c_rec - 5 end
         else
@@ -674,7 +778,7 @@ local function process_gui_commands()
         seek_to_frame(dest, is_single_step, false)
         return true
     elseif cmd_code == 4 then
-        -- PCT <0..99> 全局百分比跳轉
+        -- PCT <0..99> 百分比跳轉
         is_fast_forwarding = false
         local c_play, c_rec, c_eof = read_c_status()
         if cmd_val <= 0 then
@@ -694,53 +798,70 @@ local function process_gui_commands()
         end
         return true
     elseif cmd_code == 5 then
-        -- PROBE_EOF: 全場探底直到撞見 True EOF
+        -- PROBE_EOF: 全速探底並直達 True EOF
         is_fast_forwarding = false
         local c_play, c_rec, c_eof = read_c_status()
         if c_eof == 1 and c_rec > 500 then
             seek_to_frame(c_rec - 5, true, false)
             return true
         end
-        log_msg("PROBE_EOF_TRIGGERED: 啟動全場探底，以 600 FPS 安全極速推進至真實結尾！")
+        log_msg("PROBE_EOF_TRIGGERED: 全速探底啟動，以 600 FPS 建立歷史快照索引！")
+        local was_paused = is_paused
         reached_eof      = false
         is_paused        = false
         eof_grace_frames = 0
         pending_pct      = nil
+        freeze_tick      = 0
 
-        -- 若當前處於歷史回放位置 (cur_frame < max_seen_frame)，先瞬移回最遠乾淨快照再開始往未來衝刺
+        -- 1. 立即釋放 C 底層暫停鎖，防止 g_play_frame 卡死在原幀
+        if f_set_paused then pcall(function() f_set_paused(0) end) end
+
+        -- 2. 若有更遠的快照則載入最高快照；若在最新幀且原本為暫停，必須先載入 SLOT_PAUSE 消除 CPU 偷跑的 1 幀！
         local best_f, best_s = find_best_snapshot(max_seen_frame)
         if best_s and best_f > cur_frame then
             if f_set_rewind then pcall(function() f_set_rewind(best_f, 0) end) end
             if raw_load_slot(best_s) then
                 cur_frame = best_f
             end
+        else
+            if f_set_rewind then pcall(function() f_set_rewind(cur_frame, 0) end) end
+            if was_paused then
+                raw_load_slot(SLOT_PAUSE)
+            end
         end
 
         target_frame     = MAX_CAPACITY_FRAMES
         engine_state     = STATE_JIT_SEEK
-        pause_after_seek = true -- 探測到底後自動定格
+        pause_after_seek = true -- 探底完成後自動定格
         pcall(function() emu.speedmode("turbo") end)
-        sync_gui_state()
+        sync_gui_state(true)
         return true
     elseif cmd_code == 6 then
-        -- FFWD: 持續快轉開關切換 (隨時可再次點擊停止)
+        -- FFWD: 持續快轉切換
         local c_play, c_rec, c_eof = read_c_status()
         if is_fast_forwarding then
             is_fast_forwarding = false
             pcall(function() emu.speedmode("normal") end)
-            log_msg("FFWD_TOGGLE: 停止持續快轉，恢復正常速度")
+            log_msg("FFWD_TOGGLE: 停止快轉，恢復正常播放")
         elseif reached_eof or (c_eof == 1 and c_rec > 500 and cur_frame >= c_rec - 5) then
             is_fast_forwarding = false
             pcall(function() emu.speedmode("normal") end)
-            log_msg("FFWD_TOGGLE: 已在比賽結尾，維持定格")
+            log_msg("FFWD_TOGGLE: 已在結尾，忽略快轉")
         else
+            local was_paused   = is_paused
             is_fast_forwarding = true
-            is_paused = false
-            reached_eof = false
+            is_paused          = false
+            reached_eof        = false
+            freeze_tick        = 0
+            if f_set_paused then pcall(function() f_set_paused(0) end) end
+            if f_set_rewind then pcall(function() f_set_rewind(cur_frame, 0) end) end
+            if was_paused then
+                raw_load_slot(SLOT_PAUSE)
+            end
             pcall(function() emu.speedmode("turbo") end)
-            log_msg("FFWD_TOGGLE: 啟動持續極速快轉！")
+            log_msg("FFWD_TOGGLE: 啟動持續快轉！")
         end
-        sync_gui_state()
+        sync_gui_state(true)
         return true
     end
     return false
@@ -776,18 +897,21 @@ local function main_frame_after()
 
     -- 2. 在整幀模擬與中斷完全安定後，優先記錄乾淨快照 (含第 30 幀開局錨點 Slot 1)
     if not is_paused and not reached_eof and c_starving == 0 then
-        record_snapshot_at_frame(cur_frame)
-        if cur_frame >= max_seen_frame then
+        record_snapshot_at_frame(cur_frame, c_rec, c_eof)
+        if cur_frame >= max_seen_frame and (cur_frame % 15 == 0 or cur_frame <= 60) then
             sample_and_record_scores(cur_frame)
         end
     end
 
-    -- 3. 讀取並處理 GUI 遙控指令 (在 registerafter 內先設 delta=0 再 load，確保下一幀 ggpo_synchronize_input 100% 精準對位)
-    if process_gui_commands() then
-        -- 指令處理完畢 (可能已執行跳轉)，立刻同步最新幀號並結束當前幀，防止同幀向下誤入第 792 行的撞尾定格！
-        local p = read_c_status()
-        if p and p >= 0 then cur_frame = p end
-        return
+    -- 3. 讀取並處理 GUI 遙控指令 (正常/暫停時每幀檢查；快進狂奔時每 10 幀 [約16ms] 檢查一次)
+    local is_probing_now = (engine_state == STATE_JIT_SEEK or is_fast_forwarding)
+    if (not is_probing_now) or (cur_frame % 10 == 0) then
+        if process_gui_commands() then
+            -- 指令處理完畢 (可能已執行跳轉)，立刻同步最新幀號並結束當前幀，防止同幀向下誤入撞尾定格！
+            local p = read_c_status()
+            if p and p >= 0 then cur_frame = p end
+            return
+        end
     end
 
     -- 4. 若處於 JIT_SEEK 快轉追趕中：檢查是否已抵達 target_frame 或撞上真實結尾
@@ -813,9 +937,24 @@ local function main_frame_after()
                 eof_grace_frames = 3 -- 3 幀 normal 速度渲染最終勝利畫面
                 pause_after_seek = true
                 log_msg(string.format("JIT_SEEK_HIT_EOF: 成功抵達真實結尾 cur=%d c_rec=%d", cur_frame, c_rec))
+                sync_gui_state(true) -- 撞尾瞬間強制原子落盤！
             elseif pause_after_seek then
                 eof_grace_frames = 3
+                sync_gui_state(true)
             end
+        end
+    end
+
+    -- 4.5 若處於極速快錄 (Turbo Fast-Recording) 階段：維持 emu.speedmode("turbo")；結束瞬間自動煞車恢復 1x normal！
+    if f_is_turbo_rec and not is_paused and not reached_eof then
+        local ok_tr, is_tr = pcall(f_is_turbo_rec)
+        if ok_tr and is_tr == 1 then
+            was_turbo_recording = true
+            pcall(function() emu.speedmode("turbo") end)
+        elseif was_turbo_recording then
+            was_turbo_recording = false
+            pcall(function() emu.speedmode("normal") end)
+            log_msg("TURBO_REC_FINISHED: 極速快錄結束，已自動平滑切回 1x normal 速度！")
         end
     end
 
@@ -866,9 +1005,22 @@ local function main_frame_after()
         return
     end
 
+    -- 【動態雙軌架構】平時每 15 幀才同步 GUI (磁碟 I/O 降低 93%)；
+    -- 其餘幀僅呼叫 C 核心 (未錄影時 C 端不寫檔、立即返回)，使錄影期間 60 FPS 幀幀直出。
     if cur_frame % 15 == 0 then
         sync_gui_state()
+    elseif f_update_state then
+        local st_now = (engine_state == STATE_JIT_SEEK or is_fast_forwarding) and STATE_JIT_SEEK or STATE_PLAYBACK
+        local scr_w = (emu.screenwidth and emu.screenwidth()) or 0
+        local scr_h = (emu.screenheight and emu.screenheight()) or 0
+        pcall(function() f_update_state(cur_frame, max_seen_frame, 0, st_now, target_frame, scr_w, scr_h) end)
     end
+end
+
+if emu.registerexit then
+    emu.registerexit(function()
+        set_audio_mute(0)
+    end)
 end
 
 if emu.registerafter then

@@ -1,71 +1,133 @@
-# FightcadeRewindPlayer ⏪⏩
+# FightcadeRewindPlayer ⏪🎬⏩
 
-**FightcadeRewindPlayer** 是一款專為 Fightcade / FBNeo 回放打造的無縫時光倒流與進度跳轉控制播放器。
+[English Version (README_EN.md)](README_EN.md)
 
-透過 DLL 代理掛鉤（Proxy Hook）與 Lua 協同架構，讓原本只能單向線性播放的回放錄像，實現如 YouTube 播放器般的**任意時間倒帶、快進、0 幀完美暫停與自由跳轉**！
+**FightcadeRewindPlayer** 是一款專為 Fightcade / FBNeo 街機回放打造的**無縫時光倒流與專業廣播級錄影轉存系統 (v1.1)**。
 
----
-
-## ✨ 核心特色 (Key Features)
-
-1. **無縫時光倒流 (Seamless Rewind & Fast-Forward)**：
-   - 支援 1 秒、5 秒、10 秒、30 秒快速前進 / 倒退。
-   - 支援 1 幀精準步進，重播格鬥遊戲精準立回與確反細節。
-2. **0 幀偷跑修復 & 零 Desync (Zero Desync & Pause Head Lock)**：
-   - 專利級 GGPO 播放頭鎖死技術，暫停期間維持完美 0 幀偷跑。
-   - 解除暫停時自動對齊記憶體快照管線，確保永遠不脫節、不亂碼。
-3. **安全透明的快照探底機制 (Smart Snapshot Indexing)**：
-   - 點擊「探底並解鎖進度條」後，模擬器將高速步進建立全場記憶體快照。探底完成即解鎖時間軸滑桿自由拖曳。
-4. **極致綠色便攜 (100% Portable & Non-Invasive)**：
-   - 單一執行檔免安裝，無任何外部相依。
-   - 啟動時自動備份原廠 DLL，結束關閉時自動還原乾淨環境，完全不殘留任何修改。
-5. **深色直覺 GUI (Modern Dark UI)**：
-   - 整合微軟正黑體繁體中文介面，即時顯示幀號、進度條、當前狀態與導播指令即時日誌。
+透過獨創的底層 DLL 代理掛鉤（Proxy GGPO Hook）、記憶體顯存直通管道（Direct Named Pipe）與非同步合成架構，讓原本只能單向線性播放的回放錄像，實現如專業剪輯軟體般的**任意時間倒帶、快進、0 幀完美暫停、自由跳轉**，以及**畫質自適應廣播級 60fps MP4 錄影直出**！
 
 ---
 
-## 🚀 快速開始 (Quick Start)
+## 🚀 快速啟動步驟 (Quick Start)
 
 ### 一般玩家使用方式：
-1. 從 [Releases](https://github.com/Kimwu2000p/FightcadeRewindPlayer/releases) 下載最新版的 `FightcadeRewindPlayer.exe`。
-2. 將該執行檔放入您的 **Fightcade 安裝根目錄**（與 `Fightcade2.exe` 同一目錄）。
-3. 雙擊開啟 `FightcadeRewindPlayer.exe`。
-4. 在 Fightcade 內正常點擊回放開始觀看，播放器將自動偵測並點亮控制介面！
-
-> 💡 **操作指南**：
-> 首次觀看建議先點擊「探底並解鎖進度條」，待進度達 100% 後即可隨心所欲拖曳下方時間軸跳轉任意精彩回合！
+1. 從 [Releases](https://github.com/Kimwu2000p/FightcadeRewindPlayer/releases) 下載最新版單一執行檔 `FightcadeRewindPlayer.exe`（亦可下載隨附之 `FightcadeRewindPlayer.bat` 自行執行或檢視）。
+2. 將 `FightcadeRewindPlayer.exe` 放置於您的 **Fightcade 安裝根目錄** 下（即包含 `emulator` 資料夾的目錄，與 `Fightcade2.exe` 同一目錄）。
+3. 在瀏覽器、Fightcade 大廳複製任意重播連結（例如 `https://replay.fightcade.com/fbneo/...`），或使用程式內建戰績搜尋器查詢歷史對局。
+4. 啟動 `FightcadeRewindPlayer.exe`（剪貼簿連結自動偵測填入），點擊 **「▶ 啟動回放」** 即可自動掛載倒帶引擎開始觀看！
 
 ---
 
-## 🛠️ 開發與編譯 (Building from Source)
+## 🎛️ 導播遙控核心功能 (Director Remote Controls)
 
-專案結構如下：
-- `src/proxy_ggpo/`：GGPO.dll 代理掛鉤 C 原始碼，攔截控制幀推進與暫停。
-- `src/lua/`：導播核心腳本，負責與 FBNeo 記憶體管線溝通、保存與載入快照。
-- `tools/pack_player.ps1`：一鍵將 DLL 與 Lua 編碼內嵌並生成綠色執行檔的打包工具。
-- `FightcadeRewindPlayer.bat`：主控制介面腳本。
-
-### 編譯需求：
-- GCC (MinGW-w64 32-bit i686) 用於編譯 32-bit proxy DLL。
-- PowerShell 5.1+ 與 PS2EXE。
+* ⚡ **探底結尾 (Probe to EOF)**：以 500~600 FPS 安全極速直達比賽結尾，並解鎖全場百分比跳轉。
+* **PCT 百分比跳轉 (0% ~ 90%)**：探底完成後，可直接點擊瞬間跳轉至任意精彩回合。
+* ⏪ / ⏩ **倒帶與快進**：支援 -30s、-10s、-3s、+3s、+10s、+30s 零失誤精準跳轉與持續快進。
+* ▶ / || **暫停播放**：定格當前畫面，角色 0 幀偷跑；再次點擊 0 毫秒無縫恢復動作。
+* **-1f / +1f 微調**：單幀步進前進與後退，精準檢視立回打擊判定與目押瞬間。
 
 ---
 
-## ⚠️ 相容性與免責聲明 (Compatibility & Disclaimer)
+## 🎬 MP4 專業錄影導出工坊 (v1.1 旗艦功能)
 
-- **測試平台**：本工具目前以 **Neo-Geo《餓狼傳說 群狼之證 (Garou: Mark of the Wolves)》** 為主要深度測試與調校標的，其他機台或遊戲平台尚待社群測試回報。
-- **版權說明**：本專案為社群自製非商業開源工具，**不包含**任何未授權之遊戲 ROM、BIOS 或 Fightcade 原版程式碼。所有遊戲版權均屬原版權所有者（SNK 等公司）。
+支援將任意精彩片段（自訂起訖秒數）或全場比賽直接轉存為高畫質 60fps MP4 影片：
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│ [切片範圍]  ○ 全段錄影  ● 自由片段  [In: 00:02.0]  [Out: 00:12.0]   (10.0s)│
+├────────────────────────────────────────────────────────────────────────┤
+│ A. 解析度：    [ 🕹️ 1. 原生 1x (自動辨識 NEOGEO / CPS1~3 / 各大街機基板)  ▼] │
+│ B. 渲染模式：  [ 🕹️ 1. 原廠 AdvanceMAME Scale3x + 掃描線 [原廠 1:1 復刻] ▼] │
+│ C. HUD 模式：  [ ⭐ 1. 現代高解析條狀 HUD (半透明黑條 + 居中選手比分)    ▼] │
+├────────────────────────────────────────────────────────────────────────┤
+│ 存檔路徑：    [ C:\...\Fightcade_Clips                            ] [瀏覽] [開啟]│
+│ [● FFmpeg就緒]   [指定 FFmpeg]   [⚡ 極速快錄]    [ ● 開始轉錄 ]   [ ▲ ]       │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+* ⚡ **極速快錄模式**：勾選後以背景極速推進完成錄影（不勾選則為 1x 原速邊看邊錄），輸出畫質與音畫同步 100% 完全相同。
+* **A. 輸出解析度 (4 種規格)**：
+  1. **原生 1x**：街機點對點原始解析度（自動辨識 NeoGeo `320×224` / CPS1~3 `384×224` / PGM `448×224`）。
+  2. **720P 高清**：`1280×720` 標準高清（等比居中 960×720）。
+  3. **1080P 全高清**：`1920×1080` 滿血全高清（等比居中 1440×1080）。
+  4. **1440P (2K) 超清**：`2560×1440` 超清規格（上傳 YouTube 可強制觸發高階 VP9 編碼器，徹底防止格鬥高速畫面被壓縮模糊）。
+* **B. 渲染模式 (4 大視覺風格)**：
+  1. **原廠 AdvanceMAME Scale3x + 掃描線**：1:1 復刻 Fightcade 原廠平滑邊緣與復古掃描線質感。
+  2. **CRT 顯像管等比光柵**：整數倍點陣預縮放 + 經典 15kHz CRT 映像管光柵。
+  3. **刀鋒無損硬點陣**：完全無掃描線！像素邊緣銳利分明、硬派電競質感。
+  4. **柔和雙立方抗鋸齒**：完全無掃描線！Bicubic 雙立方平滑插值，畫面柔和順眼。
+* **C. 頂部比分與段位顯示 (HUD)**：
+  - 自動從模擬器記憶體即時感測 1P / 2P 選手名稱、即時比分、賽制 (FT) 與官方真實段位徽章 `[S / A / B / C / D / E]`。
+  - 無段位時自動隱藏並完美對稱居中，亦可切換為街機 8x8 點陣字或關閉 HUD。
 
 ---
 
-## 🤝 致謝與社群切磋 (Credits & Community)
+## 📦 放置位置與 FFmpeg 免費取得方式 (FFmpeg Setup)
 
-- 本播放器由作者搭配 **Google Gemini AI** 深度協同開發完成。
-- **作者 Fightcade ID**：`kimwu2000p`，歡迎各位格鬥同好上線一起切磋交流！
-- 歡迎提交 Issue 或 Pull Request 協助相容更多遊戲！
+本播放器的「MP4 影片轉存」功能由開源的 **FFmpeg** 驅動（若僅觀看與倒帶回放，無需安裝 FFmpeg）：
+
+### 1. 免費取得管道：
+* **管道 A（官方推薦免安裝包）**：
+  前往 GitHub 官方自動建置發布頁：
+  [https://github.com/BtbN/FFmpeg-Builds/releases](https://github.com/BtbN/FFmpeg-Builds/releases)
+  下載 `ffmpeg-master-latest-win64-gpl.zip`（或至 [https://www.gyan.dev/ffmpeg/builds/](https://www.gyan.dev/ffmpeg/builds/) 下載 `ffmpeg-release-essentials.zip`），解壓縮後將 `bin` 資料夾內的 **`ffmpeg.exe`** 複製到本程式同目錄下即可。
+* **管道 B（Windows 終端機一鍵安裝）**：
+  開啟命令提示字元 (CMD) 或 PowerShell，執行：
+  ```cmd
+  winget install Gyan.FFmpeg
+  ```
+  安裝完成後重啟本程式即可自動偵測。
+
+### 2. 放置與設定：
+- 可放置於 `Fightcade目錄	oolsfmpeg.exe` 或 `Fightcade目錄fmpeg.exe`。
+- 亦可點擊介面上的 **「指定 FFmpeg」** 按鈕手動選取電腦中任意位置的 `ffmpeg.exe`（程式會自動實機檢測版本，確保 100% 可用）。
+
+---
+
+## 💡 為什麼要「探底結尾」才能解鎖自由跳轉？（技術說明）
+
+Fightcade 的重播並非預先錄好的影片檔，而是**即時玩家按鍵封包串流 (Input Stream)**。剛開局時模擬器僅收到前幾秒的按鍵數據；透過點擊「⚡ 探底結尾」，引擎會以最高 600 FPS 極速汲取整場比賽的所有按鍵封包並建立記憶體快照索引 (Slot 1..42 安全池)，完成後即可 100% 自由倒帶與隨選跳轉！
+
+---
+
+## 🕹️ 跨基板相容性說明 (Multi-Platform Compatibility)
+
+v1.1 已深度支援並實測通過：
+* **Neo-Geo 基板** (`320×224`，如《餓狼傳說 群狼之證》、《KOF '98 / 2002》、《月華劍士 2》等)
+* **CPS1 / CPS2 / CPS3 基板** (`384×224`，如《快打旋風 III 3rd Strike》、《SF Zero 3》等)
+* **PGM 基板** (`448×224`，如《三國戰紀》、《西遊釋厄傳》等)
+* 具備動態顯存行跨距 (Pitch) 偵測、雙重雜湊開局錨點保護與硬體真實物理幀率對齊。
+
+---
+
+## 🛡️ 純綠色零殘留設計、防毒誤判排除 & 音訊排解指南
+
+### 1. 純綠色零殘留設計：
+本程式為單一免安裝執行檔，啟動回放時自動備份官方 `ggponet.dll`，關閉程式或點擊「還原官方原版 DLL」即 100% 原樣還原，絕不影響一般線上對戰與排位。
+
+### 2. 防毒誤判排除說明 (Antivirus False-Positive Guide)：
+本專案為 100% 開源免費軟體（所有原始碼公開於此 GitHub 倉庫，亦可直接以純文字編輯器開啟隨附之 `FightcadeRewindPlayer.bat` 自行檢視與編譯）。
+由於單一執行檔內嵌壓縮之代理 DLL，並需透過 Win32 IPC 與模擬器通訊，且未購買昂貴之商業 EV 數位簽章，部分防毒軟體可能出現啟發式行為誤報。排除步驟極為簡單：
+1. 開啟「Windows 安全中心」➔「病毒與威脅防護」➔「管理設定」。
+2. 滑動至最下方「排除項目」➔ 點擊「新增或移除排除項目」。
+3. 點擊「新增排除範圍」➔ 選擇「資料夾」➔ 將您的 Fightcade 資料夾加入即可永久排除。
+
+### 3. 音訊無聲排解：
+本程式於快進/暫停時採用進程內 WASAPI 智慧靜音杜絕爆音，恢復 1x 播放時自動解開靜音。若因模擬器異常閃退導致 Windows 音量混音程式將 `fcadefbneo.exe` 鎖定靜音：
+- 開啟 Windows「設定」➔「系統」➔「聲音」➔「音量混音程式」，滑動至底端點擊 **「重設所有應用程式的音量與裝置喜好設定為預設值」** 即可復原。
+
+---
+
+## 🤝 關於本專案與社群同樂 (Credits & Community)
+
+- 本程式由作者 **Kim** 與 **Google DeepMind Gemini AI** 深度協同架構、底層逆向與優化完成。
+- **作者 Fightcade ID**：`kimwu2000p`
+- 專案開源網址：[https://github.com/Kimwu2000p/FightcadeRewindPlayer](https://github.com/Kimwu2000p/FightcadeRewindPlayer)
+- 非常歡迎大家上線切磋交流，一起享受熱血街機的對戰樂趣！ :)
 
 ---
 
 ## 📄 授權條款 (License)
 
-本專案採用 [MIT License](LICENSE) 條款開源。
+本專案採用 [MIT License](LICENSE) 條款開源。  
+本專案為社群自製非商業工具，不包含任何未授權之遊戲 ROM 或 BIOS。所有遊戲商標與版權均屬原版權公司所有。

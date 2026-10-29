@@ -65,7 +65,7 @@ typedef struct tagOFNW {
 // 1. 代理身分識別簽名與版本標籤 (供外部啟動器進行冪等性防呆檢查，切勿移除)
 // ============================================================================
 __declspec(dllexport) const char* GGPONET_PROXY_SIGNATURE = "ARGON_REWIND_PROXY_V1";
-__declspec(dllexport) const char* GGPONET_PROXY_VERSION   = "v1.0.0-rc0";
+__declspec(dllexport) const char* GGPONET_PROXY_VERSION   = "v1.1.0";
 
 // 動態計算檔案 SHA-256 (零靜態依賴，安全相容 TCC)
 static void CalcFileSHA256(const char* filePath, char* outHex, size_t outHexLen) {
@@ -127,6 +127,14 @@ static void DetectExeBase() {
         g_exe_base = (uintptr_t)GetModuleHandleA(NULL);
     }
 }
+
+// 將宿主二進位絕對虛擬位址 (VA, 預設基底 0x00400000) 轉換為當前進程真實指針 (支援 ASLR 與非 ASLR)
+static inline void* GetHostPtrByVa(uintptr_t va) {
+    if (!g_exe_base) DetectExeBase();
+    if (!g_exe_base) return (void*)va;
+    return (void*)(g_exe_base + (va - 0x00400000));
+}
+
 
 // ============================================================================
 // 夥伴任務：主程式版本白名單防禦與可寫邊界檢查
@@ -237,6 +245,7 @@ static void AttachMainWindowCloseGuard(HWND hMainWnd) {
 // 3. RVA 0x01C56734: pGGPOSession (宿主真正的會話指標，必須鎖定為 g_saved_ggpo！)
 // ============================================================================
 static void* g_saved_ggpo = NULL;
+static int   g_host_session_ptrs_verified = 0;
 
 static void EnforceHostGGPOSessionAlive(void) {
     if (!g_exe_base) DetectExeBase();
@@ -246,13 +255,23 @@ static void EnforceHostGGPOSessionAlive(void) {
     volatile uint32_t* p_bGGPOFinished = (volatile uint32_t*)(g_exe_base + 0x01D21604);
     volatile void**    p_pGGPOSession  = (volatile void**)(g_exe_base + 0x01C56734);
 
+    if (!g_host_session_ptrs_verified) {
+        if (CheckMemoryWritable((const void*)p_bGGPOActive, 4) &&
+            CheckMemoryWritable((const void*)p_bGGPOFinished, 4) &&
+            CheckMemoryWritable((const void*)p_pGGPOSession, sizeof(void*))) {
+            g_host_session_ptrs_verified = 1;
+        } else {
+            return;
+        }
+    }
+
     // 自動快取 session 指標
-    if (!g_saved_ggpo && CheckMemoryWritable((const void*)p_pGGPOSession, sizeof(void*)) && *p_pGGPOSession) {
+    if (!g_saved_ggpo && *p_pGGPOSession) {
         g_saved_ggpo = (void*)*p_pGGPOSession;
     }
 
     // 1. 永遠鎖定活動旗標為 1，確保宿主的 jz 永遠不跳，每幀必定調用同步輸入！
-    if (CheckMemoryWritable((const void*)p_bGGPOActive, 4)) {
+    {
         if (*p_bGGPOActive != 1) {
             *p_bGGPOActive = 1;
             static char s_lp[MAX_PATH];
@@ -266,7 +285,7 @@ static void EnforceHostGGPOSessionAlive(void) {
     }
 
     // 2. 永遠鎖定結束旗標為 0，確保宿主絕不判定重播已死！
-    if (CheckMemoryWritable((const void*)p_bGGPOFinished, 4)) {
+    {
         if (*p_bGGPOFinished != 0) {
             *p_bGGPOFinished = 0;
             static char s_lp[MAX_PATH];
@@ -280,7 +299,7 @@ static void EnforceHostGGPOSessionAlive(void) {
     }
 
     // 3. 永遠鎖定 session 指標，確保會話永生！
-    if (g_saved_ggpo && CheckMemoryWritable((const void*)p_pGGPOSession, sizeof(void*))) {
+    if (g_saved_ggpo) {
         if (*p_pGGPOSession == NULL) {
             *p_pGGPOSession = g_saved_ggpo;
             static char s_lp[MAX_PATH];
@@ -467,6 +486,10 @@ static void IdentifyOwner(uintptr_t addr, char* out_buf, size_t buf_sz) {
 }
 
 static void RunCensusStep(int live_frame) {
+#ifndef ENABLE_LEGACY_DIAGNOSTICS
+    (void)live_frame;
+    return;
+#else
     if (!g_exe_base) DetectExeBase();
     if (!g_exe_base) return;
 
@@ -544,9 +567,14 @@ static void RunCensusStep(int live_frame) {
         g_counter_total_cands = new_cnt;
         g_counter_step = 3;
     }
+#endif
 }
 
 static void CheckCensusAtK15(int k_step) {
+#ifndef ENABLE_LEGACY_DIAGNOSTICS
+    (void)k_step;
+    return;
+#else
     if (g_counter_step != 3 || g_counter_done_k15 || k_step != 15) return;
     g_counter_done_k15 = 1;
 
@@ -587,13 +615,19 @@ static void CheckCensusAtK15(int k_step) {
     fprintf(fp, " 吻合 914/915 牆上時間候選計數器總數: %d\n", match_count);
     fprintf(fp, "========================================================================================\n");
     fclose(fp);
+#endif
 }
 
+static int g_pcur_verified = 0;
 static void LogEvent(const char* tag, int inf) {
     if (!g_exe_base) DetectExeBase();
     if (!g_exe_base) return;
     volatile uint32_t* p_cur = (volatile uint32_t*)(g_exe_base + 0x02D21B24);
-    uint32_t c_val = (p_cur && !IsBadReadPtr((const void*)p_cur, 4)) ? *p_cur : 0;
+    if (!g_pcur_verified) {
+        if (p_cur && !IsBadReadPtr((const void*)p_cur, 4)) g_pcur_verified = 1;
+        else return;
+    }
+    uint32_t c_val = *p_cur;
     int idx = g_event_idx % EVENT_RING_SIZE;
     strncpy(g_event_ring[idx].tag, tag, 7);
     g_event_ring[idx].tag[7] = '\0';
@@ -1317,6 +1351,12 @@ static int       g_census_pattern_len = 0;
 static size_t    g_my_dll_size = 0x400000;
 
 static void RunInputCensus_BeforeLoad(const uint8_t* pattern, int pattern_len) {
+#ifndef ENABLE_LEGACY_DIAGNOSTICS
+    (void)pattern;
+    (void)pattern_len;
+    g_census_cand_count = 0;
+    return;
+#else
     g_census_cand_count = 0;
     if (!pattern || pattern_len < 6) return;
     if (pattern_len > 16) pattern_len = 16;
@@ -1359,6 +1399,7 @@ static void RunInputCensus_BeforeLoad(const uint8_t* pattern, int pattern_len) {
         if (reg_end <= p) break;
         p = reg_end;
     }
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -1462,6 +1503,10 @@ static void Dump152ByteStructure(uintptr_t addr, const char* label) {
 }
 
 static int RunInputCensus_AfterLoad(int target_frame) {
+#ifndef ENABLE_LEGACY_DIAGNOSTICS
+    (void)target_frame;
+    return 0;
+#else
     if (g_census_cand_count == 0 || g_census_pattern_len < 6) return 0;
 
     static char s_log_path[MAX_PATH] = {0};
@@ -1579,6 +1624,7 @@ static int RunInputCensus_AfterLoad(int target_frame) {
         fclose(fp);
     }
     return purified_cnt;
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -1608,12 +1654,12 @@ static int g_takeover_sync_count = 0;
 static DWORD g_last_lua_state_tick = 0;
 // 600 FPS 高解析度定速巡航計時器 (完美復刻官方 → 鍵 10x 速度，防止 Turbo 跑太快吃進假空白幀)
 static LARGE_INTEGER g_qpcFreq      = {0};
-static LARGE_INTEGER g_lastBatchQpc = {0};
+static LARGE_INTEGER g_targetQpc    = {0};
 
 static void EnforceSafe600FpsSpeedLimit(void* ggpo) {
     if (g_qpcFreq.QuadPart == 0) {
         QueryPerformanceFrequency(&g_qpcFreq);
-        QueryPerformanceCounter(&g_lastBatchQpc);
+        QueryPerformanceCounter(&g_targetQpc);
     }
 
     static int s_speed_tick = 0;
@@ -1622,17 +1668,32 @@ static void EnforceSafe600FpsSpeedLimit(void* ggpo) {
     // 不在 RunFrame 內部呼叫 p_real_ggpo_idle (會破壞輸入相位)，水位補充由外部 ggpo_idle 負責
     (void)ggpo;
 
-    // 每推進 10 幀 (約 1/6 秒比賽進度)，確保耗時不少於 16.6ms (精準限制最高 600 FPS，音畫與中斷 100% 安定同步)
+    // 每推進 10 幀 (目標耗時 16.666ms = 600 FPS)：
+    // 採用 QPC 絕對目標時間戳補償法，徹底避開 Windows 15.625ms Sleep 時間片陷阱！
+    // 若在舊 CPU (如 i7-4770) 上因 Savestate 單批耗時超過 16.6ms，後續批次自動無延遲全速追趕！
     if (s_speed_tick % 10 == 0) {
+        LONGLONG batchTicks = (g_qpcFreq.QuadPart * 10) / 600;
+        g_targetQpc.QuadPart += batchTicks;
+
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        double elapsedMs = (double)(now.QuadPart - g_lastBatchQpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 
-        if (elapsedMs < 16.6) {
-            DWORD waitMs = (DWORD)(16.6 - elapsedMs);
-            if (waitMs > 0 && waitMs < 100) Sleep(waitMs);
+        if (now.QuadPart < g_targetQpc.QuadPart) {
+            double aheadMs = (double)(g_targetQpc.QuadPart - now.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+            if (aheadMs >= 16.0) {
+                Sleep(1);
+                QueryPerformanceCounter(&now);
+            }
+            while (now.QuadPart < g_targetQpc.QuadPart) {
+                SwitchToThread();
+                QueryPerformanceCounter(&now);
+            }
+        } else {
+            // 若落後超過 2 個批次 (例如正常 60 FPS 播放或暫停期間)，將目標時間軸平滑對齊至當前時間 - 1個批次補償額度
+            if (now.QuadPart - g_targetQpc.QuadPart > batchTicks * 2) {
+                g_targetQpc.QuadPart = now.QuadPart - batchTicks;
+            }
         }
-        QueryPerformanceCounter(&g_lastBatchQpc);
     }
 }
 
@@ -1659,10 +1720,9 @@ __declspec(dllexport) int __cdecl ggpo_synchronize_input(void* session, void* va
     int ret = 0x00000101;
     g_seq++;
 
-    // 壓制 Lua 對話框隱形，絕不在螢幕上露出
-    if (g_hAutoLuaWnd && IsWindow(g_hAutoLuaWnd)) {
-        ShowWindow(g_hAutoLuaWnd, SW_HIDE);
-        SetWindowPos(g_hAutoLuaWnd, NULL, -10000, -10000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_HIDEWINDOW);
+    // 【零成本視窗隱形守護】：僅在視窗意外變為可見時才呼叫 Win32 API 封印，徹底消除每幀 ShowWindow/SetWindowPos 的 DWM 核心態開銷！
+    if (g_hAutoLuaWnd && IsWindowVisible(g_hAutoLuaWnd)) {
+        MakeWindowPermanentlyInvisible(g_hAutoLuaWnd);
     }
 
     // 啟動 600 FPS 定速巡航保護，杜絕 Turbo 狂飆導致的音畫與中斷 Desync
@@ -2205,6 +2265,10 @@ __declspec(dllexport) int lua_snapshot_restore_inputs(void* L) {
 // 夥伴實驗 A：每幀持續同步淨化 (Frame-by-frame Continuous Purification)
 // ----------------------------------------------------------------------------
 static void PurifyAllMirrorsFrameByFrame(int play_f) {
+#ifndef ENABLE_LEGACY_DIAGNOSTICS
+    (void)play_f;
+    return;
+#else
     if (!g_exe_base || play_f < 0 || play_f >= g_record_frame) return;
 
     uint8_t cur_hist_input[16] = {0};
@@ -2230,6 +2294,7 @@ static void PurifyAllMirrorsFrameByFrame(int play_f) {
             }
         }
     }
+#endif
 }
 
 __declspec(dllexport) int lua_set_continuous_purify(void* L) {
@@ -2299,6 +2364,1098 @@ __declspec(dllexport) int lua_set_counter_writeback(void* L) {
 // ----------------------------------------------------------------------------
 // 回傳 (cmd_code, cmd_val):
 // cmd_code: 0=無指令, 1=SEEK絕對幀, 2=PAUSE切換, 3=DELTA相對幀, 4=PCT百分比(0..99)
+
+// ============================================================================
+// 進程內原生直出錄影引擎 (Native Direct Pipe Recorder Engine - Route A)
+// 【視訊單管道 + 音訊極速暫存 WAV + 結束時 0.2 秒極速無失真封裝】
+// 100% 根除 Windows 雙具名管道的所有競爭、死結與交錯讀取卡死問題！
+// ============================================================================
+static volatile int g_bNativeRecording = 0;
+static volatile int g_bPipeVConnected = 0;
+static HANDLE g_hPipeVideo = INVALID_HANDLE_VALUE;
+static HANDLE g_hAudioFile = INVALID_HANDLE_VALUE;
+static HANDLE g_hThreadV = NULL;
+static PROCESS_INFORMATION g_ffmpeg_pi = {0};
+static int g_rec_start_frame = 0;
+static int g_rec_end_frame = 0;
+static int g_rec_is_full = 0;
+static int g_rec_is_turbo = 0;
+static int g_rec_need_seek_back = 0;
+static int g_rec_last_cur_frame = 0;
+static int g_rec_scale_mode = 0;
+static int g_rec_res_mode = 3;     // 1=原生 (1x 自動辨識), 2=720P, 3=1080P
+static int g_rec_render_mode = 1;  // 1=CRT顯像管等比光柵, 2=刀鋒無損硬點陣, 3=柔和抗鋸齒
+static int g_game_width = 320;
+static int g_game_height = 224;
+static int g_rec_width = 320;
+static int g_rec_height = 224;
+static char g_rec_out_mp4[MAX_PATH] = {0};
+static char g_rec_temp_v_mp4[MAX_PATH] = {0};
+static char g_rec_temp_a_wav[MAX_PATH] = {0};
+static char g_rec_ffmpeg_path[MAX_PATH] = {0};
+static char g_rec_pipe_v_name[64] = {0};
+static uint32_t* g_rec_bgra_buf = NULL;
+static size_t g_rec_bgra_cap = 0;
+static int g_rec_frames_written = 0;
+static int g_rec_has_reached_start = 0;
+static DWORD g_rec_audio_bytes = 0;
+static int g_rec_attempts = 0;
+static volatile int g_rec_state_dirty = 0;
+static int g_rec_show_osd = 1;
+static char g_rec_p1_name[64] = "Player 1";
+static char g_rec_p2_name[64] = "Player 2";
+static char g_rec_p1_rank[16] = "C";
+static char g_rec_p2_rank[16] = "B";
+static char g_rec_match_ft[16] = "FT10";
+
+static void LogRec(const char* fmt, ...) {
+    char buf[1024];
+    va_list va;
+    va_start(va, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, va);
+    va_end(va);
+
+    char log_path[MAX_PATH];
+    snprintf(log_path, sizeof(log_path), "%sscripts\\rewind_debug.log", g_module_dir);
+    FILE* fp = fopen(log_path, "a");
+    if (fp) {
+        fprintf(fp, "[NATIVE_REC] %s\n", buf);
+        fclose(fp);
+    }
+}
+
+// ============================================================================
+// 經典復古 8x8 點陣字型引擎 (支援即時動態比分與雙選手 ID 浮層 OSD)
+// ============================================================================
+static const uint8_t font8x8_osd[128][8] = {
+    [' '] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    ['-'] = { 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00 },
+    ['.'] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00 },
+    [':'] = { 0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00 },
+    ['['] = { 0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00 },
+    [']'] = { 0x78, 0x18, 0x18, 0x18, 0x18, 0x18, 0x78, 0x00 },
+    ['('] = { 0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00 },
+    [')'] = { 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00 },
+    ['/'] = { 0x02, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00 },
+    ['0'] = { 0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00 },
+    ['1'] = { 0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00 },
+    ['2'] = { 0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00 },
+    ['3'] = { 0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00 },
+    ['4'] = { 0x0C, 0x1C, 0x34, 0x64, 0x7E, 0x04, 0x04, 0x00 },
+    ['5'] = { 0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00 },
+    ['6'] = { 0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00 },
+    ['7'] = { 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00 },
+    ['8'] = { 0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00 },
+    ['9'] = { 0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00 },
+    ['A'] = { 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00 },
+    ['B'] = { 0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00 },
+    ['C'] = { 0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00 },
+    ['D'] = { 0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00 },
+    ['E'] = { 0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x7E, 0x00 },
+    ['F'] = { 0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00 },
+    ['G'] = { 0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0x00 },
+    ['H'] = { 0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00 },
+    ['I'] = { 0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00 },
+    ['J'] = { 0x0E, 0x06, 0x06, 0x06, 0x06, 0x66, 0x3C, 0x00 },
+    ['K'] = { 0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00 },
+    ['L'] = { 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00 },
+    ['M'] = { 0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00 },
+    ['N'] = { 0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0x00 },
+    ['O'] = { 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00 },
+    ['P'] = { 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00 },
+    ['Q'] = { 0x3C, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x0E, 0x00 },
+    ['R'] = { 0x7C, 0x66, 0x66, 0x7C, 0x78, 0x6C, 0x66, 0x00 },
+    ['S'] = { 0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00 },
+    ['T'] = { 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00 },
+    ['U'] = { 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00 },
+    ['V'] = { 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00 },
+    ['W'] = { 0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00 },
+    ['X'] = { 0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00 },
+    ['Y'] = { 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00 },
+    ['Z'] = { 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00 },
+    ['a'] = { 0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3B, 0x00 },
+    ['b'] = { 0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00 },
+    ['c'] = { 0x00, 0x00, 0x3C, 0x66, 0x60, 0x66, 0x3C, 0x00 },
+    ['d'] = { 0x06, 0x06, 0x3E, 0x66, 0x66, 0x66, 0x3B, 0x00 },
+    ['e'] = { 0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0x00 },
+    ['f'] = { 0x0E, 0x18, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x00 },
+    ['g'] = { 0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x3C },
+    ['h'] = { 0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00 },
+    ['i'] = { 0x18, 0x00, 0x38, 0x18, 0x18, 0x18, 0x3C, 0x00 },
+    ['j'] = { 0x06, 0x00, 0x0E, 0x06, 0x06, 0x66, 0x3C, 0x00 },
+    ['k'] = { 0x60, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0x00 },
+    ['l'] = { 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00 },
+    ['m'] = { 0x00, 0x00, 0x76, 0x7F, 0x6B, 0x6B, 0x63, 0x00 },
+    ['n'] = { 0x00, 0x00, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00 },
+    ['o'] = { 0x00, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x3C, 0x00 },
+    ['p'] = { 0x00, 0x00, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60 },
+    ['q'] = { 0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x06 },
+    ['r'] = { 0x00, 0x00, 0x7C, 0x66, 0x60, 0x60, 0x60, 0x00 },
+    ['s'] = { 0x00, 0x00, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x00 },
+    ['t'] = { 0x18, 0x18, 0x7E, 0x18, 0x18, 0x18, 0x0E, 0x00 },
+    ['u'] = { 0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3B, 0x00 },
+    ['v'] = { 0x00, 0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00 },
+    ['w'] = { 0x00, 0x00, 0x63, 0x6B, 0x7F, 0x3E, 0x36, 0x00 },
+    ['x'] = { 0x00, 0x00, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x00 },
+    ['y'] = { 0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C },
+    ['z'] = { 0x00, 0x00, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00 },
+    ['_'] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00 }
+};
+
+static void DrawRectAlpha(uint32_t* buf, int w, int h, int rx, int ry, int rw, int rh, uint32_t color, uint8_t alpha) {
+    if (rx < 0) rx = 0;
+    if (ry < 0) ry = 0;
+    int x2 = rx + rw; if (x2 > w) x2 = w;
+    int y2 = ry + rh; if (y2 > h) y2 = h;
+    uint32_t inv_a = 255 - alpha;
+    uint32_t cr = (color >> 16) & 0xFF;
+    uint32_t cg = (color >> 8) & 0xFF;
+    uint32_t cb = color & 0xFF;
+    for (int y = ry; y < y2; y++) {
+        uint32_t* row = buf + y * w;
+        for (int x = rx; x < x2; x++) {
+            uint32_t orig = row[x];
+            uint32_t ob = orig & 0xFF;
+            uint32_t og = (orig >> 8) & 0xFF;
+            uint32_t or_ = (orig >> 16) & 0xFF;
+            uint32_t nb = (cb * alpha + ob * inv_a) >> 8;
+            uint32_t ng = (cg * alpha + og * inv_a) >> 8;
+            uint32_t nr = (cr * alpha + or_ * inv_a) >> 8;
+            row[x] = 0xFF000000 | (nr << 16) | (ng << 8) | nb;
+        }
+    }
+}
+
+static void DrawCharBGRA(uint32_t* buf, int w, int h, int cx, int cy, char ch, uint32_t color, uint32_t shadow, int scale) {
+    if (ch < 0 || ch >= 128) ch = '?';
+    const uint8_t* glyph = font8x8_osd[(int)ch];
+    if (scale <= 1) {
+        // 原廠細字 (8x8 點陣): 象牙金本體 + 1px 純黑陰影
+        for (int y = 0; y < 8; y++) {
+            int py = cy + y;
+            if (py < 0 || py >= h) continue;
+            uint8_t row = glyph[y];
+            for (int x = 0; x < 8; x++) {
+                int px = cx + x;
+                if (px < 0 || px >= w) continue;
+                if (row & (0x80 >> x)) {
+                    if (px + 1 < w && py + 1 < h) {
+                        buf[(py + 1) * w + (px + 1)] = shadow;
+                    }
+                }
+            }
+        }
+        for (int y = 0; y < 8; y++) {
+            int py = cy + y;
+            if (py < 0 || py >= h) continue;
+            uint8_t row = glyph[y];
+            for (int x = 0; x < 8; x++) {
+                int px = cx + x;
+                if (px < 0 || px >= w) continue;
+                if (row & (0x80 >> x)) {
+                    buf[py * w + px] = color;
+                }
+            }
+        }
+    } else {
+        // 原廠大(粗)字 (16x16 整數倍放大): 筆畫自然加粗
+        for (int y = 0; y < 8; y++) {
+            uint8_t row = glyph[y];
+            for (int x = 0; x < 8; x++) {
+                if (row & (0x80 >> x)) {
+                    for (int sy = 0; sy < scale; sy++) {
+                        int py = cy + y * scale + sy + 1;
+                        if (py < 0 || py >= h) continue;
+                        for (int sx = 0; sx < scale; sx++) {
+                            int px = cx + x * scale + sx + 1;
+                            if (px < 0 || px >= w) continue;
+                            buf[py * w + px] = shadow;
+                        }
+                    }
+                }
+            }
+        }
+        for (int y = 0; y < 8; y++) {
+            uint8_t row = glyph[y];
+            for (int x = 0; x < 8; x++) {
+                if (row & (0x80 >> x)) {
+                    for (int sy = 0; sy < scale; sy++) {
+                        int py = cy + y * scale + sy;
+                        if (py < 0 || py >= h) continue;
+                        for (int sx = 0; sx < scale; sx++) {
+                            int px = cx + x * scale + sx;
+                            if (px < 0 || px >= w) continue;
+                            buf[py * w + px] = color;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void DrawStringBGRA(uint32_t* buf, int w, int h, int x, int y, const char* str, uint32_t color, uint32_t shadow, int scale) {
+    if (!str) return;
+    if (scale <= 0) scale = 1;
+    while (*str) {
+        DrawCharBGRA(buf, w, h, x, y, *str, color, shadow, scale);
+        x += 8 * scale;
+        str++;
+    }
+}
+
+// 原生安全讀取 FBNeo 記憶體中的選手名稱 (UTF-16LE 轉 ASCII)
+static void SafeGetPlayerName(uint32_t va, char* out_buf, size_t max_len, const char* fallback) {
+    if (!out_buf || max_len == 0) return;
+    out_buf[0] = '\0';
+    const wchar_t* pWide = (const wchar_t*)GetHostPtrByVa(va);
+    if (pWide && !IsBadReadPtr(pWide, 4)) {
+        size_t idx = 0;
+        while (idx < max_len - 1 && !IsBadReadPtr(&pWide[idx], 2)) {
+            wchar_t w = pWide[idx];
+            if (w == 0) break;
+            if (w >= 32 && w <= 126) {
+                out_buf[idx] = (char)w;
+            } else {
+                out_buf[idx] = '?';
+            }
+            idx++;
+        }
+        out_buf[idx] = '\0';
+    }
+    if (out_buf[0] == '\0' && fallback) {
+        strncpy(out_buf, fallback, max_len - 1);
+        out_buf[max_len - 1] = '\0';
+    }
+}
+
+static void ConvertToBGRA32(const void* src, uint32_t* dst, int w, int h, int pitch, int bpp, int maskType) {
+    if (pitch <= 0 || pitch < w * (bpp == 4 ? 4 : 2)) {
+        pitch = w * (bpp == 4 ? 4 : 2); // 100% NeoGeo 緊湊排列經典保底
+    }
+    // 【P2-3 零拷貝優化】：若已為 32-bit (bpp == 4) 且顯存為連續緊湊行 (pitch == w * 4)，整幀記憶體極速直出，完全免逐行迴圈！
+    if (bpp == 4 && pitch == w * 4) {
+        memcpy(dst, src, (size_t)w * h * 4);
+        return;
+    }
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row_src = (const uint8_t*)src + (size_t)y * pitch;
+        uint32_t* row_dst = dst + (size_t)y * w;
+        if (bpp == 2) {
+            const uint16_t* s = (const uint16_t*)row_src;
+            if (maskType == 0x0F) { // 15-bit 555
+                for (int x = 0; x < w; x++) {
+                    uint16_t pix = s[x];
+                    uint8_t r = (pix >> 10) & 0x1F;
+                    uint8_t g = (pix >> 5) & 0x1F;
+                    uint8_t b = pix & 0x1F;
+                    row_dst[x] = ((uint32_t)((r << 3) | (r >> 2)) << 16) |
+                                 ((uint32_t)((g << 3) | (g >> 2)) << 8)  |
+                                 ((uint32_t)((b << 3) | (b >> 2)))       | 0xFF000000;
+                }
+            } else { // 16-bit 565
+                for (int x = 0; x < w; x++) {
+                    uint16_t pix = s[x];
+                    uint8_t r = (pix >> 11) & 0x1F;
+                    uint8_t g = (pix >> 5) & 0x3F;
+                    uint8_t b = pix & 0x1F;
+                    row_dst[x] = ((uint32_t)((r << 3) | (r >> 2)) << 16) |
+                                 ((uint32_t)((g << 2) | (g >> 4)) << 8)  |
+                                 ((uint32_t)((b << 3) | (b >> 2)))       | 0xFF000000;
+                }
+            }
+        } else if (bpp == 4) {
+            memcpy(row_dst, row_src, (size_t)w * 4);
+        }
+    }
+}
+
+static DWORD WINAPI PipeThreadV(LPVOID param) {
+    if (g_hPipeVideo != INVALID_HANDLE_VALUE) {
+        BOOL ok = ConnectNamedPipe(g_hPipeVideo, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (ok) {
+            g_bPipeVConnected = 1;
+            LogRec("Video Pipe connected successfully: %s", g_rec_pipe_v_name);
+        } else {
+            LogRec("Video Pipe connect failed, err=%lu", GetLastError());
+        }
+    }
+    return 0;
+}
+
+static void WriteWavHeader(HANDLE hFile, DWORD dataSize) {
+    DWORD dwWritten = 0;
+    SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+    unsigned char h[44];
+    memcpy(h, "RIFF", 4);
+    DWORD fileSize = dataSize + 36;
+    memcpy(h + 4, &fileSize, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    DWORD subchunk1Size = 16;
+    memcpy(h + 16, &subchunk1Size, 4);
+    WORD audioFormat = 1; // PCM
+    memcpy(h + 20, &audioFormat, 2);
+    WORD numChannels = 2; // 立體聲
+    memcpy(h + 22, &numChannels, 2);
+    DWORD sampleRate = 44100;
+    memcpy(h + 24, &sampleRate, 4);
+    DWORD byteRate = sampleRate * 2 * 2; // 44100 * 2 * 2 = 176400
+    memcpy(h + 28, &byteRate, 4);
+    WORD blockAlign = 4;
+    memcpy(h + 32, &blockAlign, 2);
+    WORD bitsPerSample = 16;
+    memcpy(h + 34, &bitsPerSample, 2);
+    memcpy(h + 36, "data", 4);
+    memcpy(h + 40, &dataSize, 4);
+    WriteFile(hFile, h, 44, &dwWritten, NULL);
+}
+
+
+// ============================================================================
+// Turbo 模式動態逐幀全量渲染器 (Turbo Offline Fast-Render Hotpatch Engine)
+// 動態替換 RVA 0x49E3A (74 05 -> 90 90 NOP NOP)，徹底解鎖 Turbo 下的 Frameskip 跳幀！
+// ============================================================================
+static int g_turbo_branch_patched = 0;
+static int g_orig_always_draw = 0;
+
+static void EnableTurboFullRender(int enable) {
+    if (!g_exe_base) DetectExeBase();
+    if (!g_exe_base) return;
+
+    uint8_t* pTarget = (uint8_t*)(g_exe_base + 0x49E3A);
+    int* pAlwaysDraw = (int*)(g_exe_base + 0x1D21690);
+
+    DWORD oldProtect = 0;
+    if (enable) {
+        // 1. 動態記憶體啟用 bAlwaysDrawFrames = 1 (錄製期間強制滿幀渲染，消除跳幀)
+        if (pAlwaysDraw && !IsBadWritePtr(pAlwaysDraw, 4)) {
+            g_orig_always_draw = *pAlwaysDraw;
+            *pAlwaysDraw = 1;
+            LogRec("DYNAMIC_RENDER: Set bAlwaysDrawFrames = 1 in memory (was %d)", g_orig_always_draw);
+        }
+
+        // 2. 熱補丁 RVA 0x49E3A (解鎖 Turbo 繪圖分支)
+        if (!g_turbo_branch_patched) {
+            if (pTarget[0] == 0x74 && pTarget[1] == 0x05) {
+                if (VirtualProtect(pTarget, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    pTarget[0] = 0x90;
+                    pTarget[1] = 0x90;
+                    VirtualProtect(pTarget, 2, oldProtect, &oldProtect);
+                    FlushInstructionCache(GetCurrentProcess(), pTarget, 2);
+                    g_turbo_branch_patched = 1;
+                    LogRec("TURBO_RENDER_HOTPATCH: Successfully patched 0x49E3A to NOP NOP! Frameskip unlocked.");
+                }
+            } else {
+                LogRec("TURBO_RENDER_HOTPATCH: Target bytes mismatch (0x%02X 0x%02X), skip patch.", pTarget[0], pTarget[1]);
+            }
+        }
+    } else {
+        // 1. 還原記憶體 bAlwaysDrawFrames (還原為跳幀極限加速模式，確保 2500 FPS 探底光速不受影響)
+        if (pAlwaysDraw && !IsBadWritePtr(pAlwaysDraw, 4)) {
+            *pAlwaysDraw = g_orig_always_draw;
+            LogRec("DYNAMIC_RENDER: Restored bAlwaysDrawFrames = %d in memory", g_orig_always_draw);
+        }
+
+        // 2. 還原 RVA 0x49E3A
+        if (g_turbo_branch_patched) {
+            if (VirtualProtect(pTarget, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                pTarget[0] = 0x74;
+                pTarget[1] = 0x05;
+                VirtualProtect(pTarget, 2, oldProtect, &oldProtect);
+                FlushInstructionCache(GetCurrentProcess(), pTarget, 2);
+                g_turbo_branch_patched = 0;
+                LogRec("TURBO_RENDER_HOTPATCH: Successfully restored 0x49E3A to 74 05.");
+            }
+        }
+    }
+}
+
+typedef struct {
+    HANDLE hFfmpegProcess;
+    HANDLE hFfmpegThread;
+    HANDLE hAudioFile;
+    DWORD audioBytes;
+    char ffmpegPath[MAX_PATH];
+    char tempVMp4[MAX_PATH];
+    char tempAWav[MAX_PATH];
+    char outMp4[MAX_PATH];
+    char moduleDir[MAX_PATH];
+} RemuxJobArgs;
+
+static DWORD WINAPI ThreadRemuxWorker(LPVOID lpParam) {
+    RemuxJobArgs* args = (RemuxJobArgs*)lpParam;
+    if (!args) return 0;
+
+    LogRec("[ASYNC_REMUX] Worker started in background. Emulator main thread is 100% free!");
+
+    // 1. 等待第一隻視訊 FFmpeg 完全退出，寫完 moov atom
+    // 【P1-2 修復】: 10 秒超時主動 TerminateProcess，徹底杜絕孤兒進程常駐與檔案鎖死！
+    if (args->hFfmpegProcess) {
+        LogRec("[ASYNC_REMUX] Waiting for FFmpeg video stream to finalize...");
+        DWORD waitRes = WaitForSingleObject(args->hFfmpegProcess, 10000);
+        if (waitRes == WAIT_TIMEOUT) {
+            LogRec("[ASYNC_REMUX] WARNING: Video FFmpeg stream timed out after 10s! Forcing termination.");
+            TerminateProcess(args->hFfmpegProcess, 1);
+        }
+        CloseHandle(args->hFfmpegProcess);
+        if (args->hFfmpegThread) CloseHandle(args->hFfmpegThread);
+    }
+
+    // 2. 回填音訊 WAV Header 並關閉音訊檔
+    if (args->hAudioFile != INVALID_HANDLE_VALUE) {
+        WriteWavHeader(args->hAudioFile, args->audioBytes);
+        FlushFileBuffers(args->hAudioFile);
+        CloseHandle(args->hAudioFile);
+        LogRec("[ASYNC_REMUX] Audio WAV finalized (bytes=%lu)", args->audioBytes);
+    }
+
+    // 3. 執行無損快速合流
+    if (GetFileAttributesA(args->tempVMp4) != INVALID_FILE_ATTRIBUTES) {
+        WIN32_FILE_ATTRIBUTE_DATA fadV = {0}, fadA = {0};
+        ULONGLONG szV = 0, szA = 0;
+        if (GetFileAttributesExA(args->tempVMp4, GetFileExInfoStandard, &fadV)) {
+            szV = ((ULONGLONG)fadV.nFileSizeHigh << 32) | fadV.nFileSizeLow;
+        }
+        if (GetFileAttributesA(args->tempAWav) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesExA(args->tempAWav, GetFileExInfoStandard, &fadA)) {
+            szA = ((ULONGLONG)fadA.nFileSizeHigh << 32) | fadA.nFileSizeLow;
+        }
+        LogRec("[ASYNC_REMUX] Files status: temp_v=%llu bytes, temp_a=%llu bytes", szV, szA);
+
+        if (szV > 0) {
+            char mergeCmd[2048];
+            if (szA > 44) {
+                snprintf(mergeCmd, sizeof(mergeCmd),
+                    "\"%s\" -y -i \"%s\" -ignore_length 1 -i \"%s\" -c:v copy -c:a aac -b:a 192k -af \"aresample=async=1000\" -shortest -movflags +faststart \"%s\"",
+                    args->ffmpegPath, args->tempVMp4, args->tempAWav, args->outMp4);
+            } else {
+                snprintf(mergeCmd, sizeof(mergeCmd),
+                    "\"%s\" -y -i \"%s\" -c:v copy \"%s\"",
+                    args->ffmpegPath, args->tempVMp4, args->outMp4);
+            }
+
+            LogRec("[ASYNC_REMUX] Executing: %s", mergeCmd);
+
+            char ffLogPath[MAX_PATH];
+            snprintf(ffLogPath, sizeof(ffLogPath), "%sffmpeg_run.log", args->moduleDir);
+            SECURITY_ATTRIBUTES sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.nLength = sizeof(sa);
+            sa.bInheritHandle = TRUE;
+            HANDLE hLog = CreateFileA(ffLogPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+            STARTUPINFOA siM;
+            PROCESS_INFORMATION piM;
+            memset(&siM, 0, sizeof(siM));
+            memset(&piM, 0, sizeof(piM));
+            siM.cb = sizeof(siM);
+            siM.dwFlags = STARTF_USESHOWWINDOW | (hLog != INVALID_HANDLE_VALUE ? STARTF_USESTDHANDLES : 0);
+            siM.wShowWindow = SW_HIDE;
+            if (hLog != INVALID_HANDLE_VALUE) {
+                siM.hStdOutput = hLog;
+                siM.hStdError = hLog;
+            }
+
+            if (CreateProcessA(NULL, mergeCmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &siM, &piM)) {
+                if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+                DWORD waitM = WaitForSingleObject(piM.hProcess, 15000);
+                if (waitM == WAIT_TIMEOUT) {
+                    LogRec("[ASYNC_REMUX] WARNING: Remux process timed out after 15s! Forcing termination.");
+                    TerminateProcess(piM.hProcess, 1);
+                }
+                DWORD exitCode = 0;
+                GetExitCodeProcess(piM.hProcess, &exitCode);
+                CloseHandle(piM.hProcess);
+                CloseHandle(piM.hThread);
+                LogRec("[ASYNC_REMUX] Completed exitCode=%lu! Target: %s", exitCode, args->outMp4);
+            } else {
+                if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+                LogRec("[ASYNC_REMUX] ERROR: CreateProcess failed for remux! err=%lu", GetLastError());
+            }
+
+            WIN32_FILE_ATTRIBUTE_DATA fadOut;
+            if (GetFileAttributesExA(args->outMp4, GetFileExInfoStandard, &fadOut) &&
+                (((ULONGLONG)fadOut.nFileSizeHigh << 32) | fadOut.nFileSizeLow) > 0) {
+                LogRec("[ASYNC_REMUX] Final MP4 verified! Size=%lu bytes", fadOut.nFileSizeLow);
+                DeleteFileA(args->tempVMp4);
+                DeleteFileA(args->tempAWav);
+            } else {
+                LogRec("[ASYNC_REMUX] Emergency copy temp_v.mp4 to output!");
+                CopyFileA(args->tempVMp4, args->outMp4, FALSE);
+            }
+        }
+    }
+
+    LogRec("[ASYNC_REMUX] Background worker finished.");
+    free(args);
+    return 0;
+}
+
+static void StopNativeRecording(const char* caller) {
+    if (!g_bNativeRecording && g_hPipeVideo == INVALID_HANDLE_VALUE) return;
+    LogRec("Stopping native recording (CALLER: %s)... Total frames written: %d", caller ? caller : "UNKNOWN", g_rec_frames_written);
+    g_bNativeRecording = 0;
+    g_rec_is_turbo = 0;
+    g_bPipeVConnected = 0;
+    g_rec_state_dirty = 1; // 確保 GUI 一定讀到 is_rec=0 的最終狀態
+    EnableTurboFullRender(0);
+
+    // 1. 先斷開並關閉視訊管道，送出 EOF 給第一個 FFmpeg
+    if (g_hPipeVideo != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(g_hPipeVideo);
+        CloseHandle(g_hPipeVideo);
+        g_hPipeVideo = INVALID_HANDLE_VALUE;
+    }
+
+    if (g_hThreadV) {
+        CloseHandle(g_hThreadV);
+        g_hThreadV = NULL;
+    }
+
+    // 2. 封裝所有後台作業交由獨立 Worker 線程處理，模擬器主線程 0 毫秒立即返回，100% 保持 60 FPS！
+    RemuxJobArgs* args = (RemuxJobArgs*)malloc(sizeof(RemuxJobArgs));
+    if (args) {
+        memset(args, 0, sizeof(RemuxJobArgs));
+        args->hFfmpegProcess = g_ffmpeg_pi.hProcess;
+        args->hFfmpegThread  = g_ffmpeg_pi.hThread;
+        args->hAudioFile     = g_hAudioFile;
+        args->audioBytes     = g_rec_audio_bytes;
+        strncpy(args->ffmpegPath, g_rec_ffmpeg_path, sizeof(args->ffmpegPath) - 1);
+        strncpy(args->tempVMp4,   g_rec_temp_v_mp4,   sizeof(args->tempVMp4) - 1);
+        strncpy(args->tempAWav,   g_rec_temp_a_wav,   sizeof(args->tempAWav) - 1);
+        strncpy(args->outMp4,     g_rec_out_mp4,     sizeof(args->outMp4) - 1);
+        strncpy(args->moduleDir,  g_module_dir,       sizeof(args->moduleDir) - 1);
+
+        memset(&g_ffmpeg_pi, 0, sizeof(g_ffmpeg_pi));
+        g_hAudioFile = INVALID_HANDLE_VALUE;
+
+        HANDLE hWorker = CreateThread(NULL, 0, ThreadRemuxWorker, args, 0, NULL);
+        if (hWorker) {
+            CloseHandle(hWorker);
+        } else {
+            // 【P1-4 修復】: 線程創建失敗時執行同步兜底釋放，防止三重洩漏
+            LogRec("ERROR: CreateThread failed for remux worker! Fallback synchronous cleanup.");
+            if (args->hFfmpegProcess) {
+                TerminateProcess(args->hFfmpegProcess, 1);
+                CloseHandle(args->hFfmpegProcess);
+            }
+            if (args->hFfmpegThread) CloseHandle(args->hFfmpegThread);
+            if (args->hAudioFile != INVALID_HANDLE_VALUE) CloseHandle(args->hAudioFile);
+            free(args);
+        }
+    }
+    LogRec("StopNativeRecording returned immediately, zero lag for emulator!");
+}
+
+// ============================================================================
+// 動態街機顯存架構解析引擎 (CPS3 384x224 / NeoGeo 320x224 / CPS1/2 384x224 自適應)
+// ============================================================================
+static void DetectGameResolution(int* out_w, int* out_h) {
+    int w = 0, h = 0;
+    if (!g_exe_base) DetectExeBase();
+    if (g_exe_base) {
+        // 1. 優先嘗試 FBNeo 底層渲染核心顯存 (nBurnWidth 0x0202d4b0, nBurnHeight 0x0202d4ac)
+        int* pCoreW = (int*)GetHostPtrByVa(0x0202d4b0);
+        int* pCoreH = (int*)GetHostPtrByVa(0x0202d4ac);
+        if (pCoreW && pCoreH && !IsBadReadPtr(pCoreW, 4) && !IsBadReadPtr(pCoreH, 4)) {
+            if (*pCoreW > 0 && *pCoreW <= 1920 && *pCoreH > 0 && *pCoreH <= 1080) {
+                w = *pCoreW;
+                h = *pCoreH;
+            }
+        }
+        // 2. 次選: FBNeo Driver 結構體成員 (pDriver[nBurnDrvSelect]->nWidth +0x88, ->nHeight +0x8C)
+        if (w <= 0 || h <= 0) {
+            int* pDrvSel = (int*)GetHostPtrByVa(0x01209750);
+            if (pDrvSel && !IsBadReadPtr(pDrvSel, 4)) {
+                int drv_idx = *pDrvSel;
+                if (drv_idx >= 0 && drv_idx < 20000) {
+                    uintptr_t* pDriverArr = (uintptr_t*)GetHostPtrByVa(0x00f2b580);
+                    if (pDriverArr && !IsBadReadPtr(&pDriverArr[drv_idx], sizeof(uintptr_t))) {
+                        uintptr_t pDrv = pDriverArr[drv_idx];
+                        if (pDrv && !IsBadReadPtr((void*)pDrv, 0x100)) {
+                            // 【P0-1 修復】: pDrv 已為真實 Host 指標，直接型別轉換，嚴禁二次傳入 GetHostPtrByVa！
+                            int* pDW = (int*)(pDrv + 0x88);
+                            int* pDH = (int*)(pDrv + 0x8c);
+                            if (pDW && pDH && !IsBadReadPtr(pDW, 4) && !IsBadReadPtr(pDH, 4)) {
+                                if (*pDW > 0 && *pDW <= 1920 && *pDH > 0 && *pDH <= 1080) {
+                                    w = *pDW;
+                                    h = *pDH;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 3. 第三備選: 舊有表面濾鏡寬高 (0x031943ac, 0x031943b0)
+        if (w <= 0 || h <= 0) {
+            int* pOldW = (int*)GetHostPtrByVa(0x031943ac);
+            int* pOldH = (int*)GetHostPtrByVa(0x031943b0);
+            if (pOldW && pOldH && !IsBadReadPtr(pOldW, 4) && !IsBadReadPtr(pOldH, 4)) {
+                if (*pOldW > 0 && *pOldW <= 1920 && *pOldH > 0 && *pOldH <= 1080) {
+                    w = *pOldW;
+                    h = *pOldH;
+                }
+            }
+        }
+    }
+    // 4. 第四備選: Lua 通報之即時遊戲畫面大小 (g_game_width, g_game_height)
+    if (w <= 0 || h <= 0) {
+        if (g_game_width > 0 && g_game_height > 0) {
+            w = g_game_width;
+            h = g_game_height;
+        }
+    }
+    // 5. 終極保底: 320x224 (NeoGeo)
+    if (w <= 0 || h <= 0) {
+        w = 320;
+        h = 224;
+    }
+    *out_w = w;
+    *out_h = h;
+}
+
+// 純 C 靜態 95 字元 ASCII 像素寬度查表 (Segoe UI Bold 24px，零外部 DLL 依賴，100% 安全)
+static int SafeCalcTextWidth24(const char* text) {
+    if (!text) return 0;
+    static const unsigned char w_table[95] = {
+        7, 8, 12, 14, 14, 21, 20, 7, 9, 9, 11, 17, 7, 10, 7, 12,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 7, 7, 17, 17, 17, 11,
+        23, 17, 15, 15, 18, 13, 12, 17, 18, 8, 11, 16, 12, 23, 19, 18,
+        15, 19, 17, 13, 14, 17, 16, 24, 16, 15, 15, 9, 12, 9, 17, 10,
+        8, 13, 15, 12, 15, 13, 10, 15, 14, 7, 9, 14, 7, 22, 15, 15,
+        15, 15, 10, 11, 9, 15, 13, 19, 14, 14, 12, 9, 8, 9, 17
+    };
+    int total = 0;
+    for (const unsigned char* p = (const unsigned char*)text; *p; p++) {
+        if (*p >= 32 && *p <= 126) total += w_table[*p - 32];
+        else total += 14;
+    }
+    return total;
+}
+
+static const char* GetSafeFontOpt() {
+    static char fontOpt[MAX_PATH] = {0};
+    static int s_inited = 0;
+    if (s_inited) return fontOpt;
+    s_inited = 1;
+
+    const char* candidates[] = {
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\msyhbd.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttc"
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (GetFileAttributesA(candidates[i]) != INVALID_FILE_ATTRIBUTES) {
+            char pBuf[MAX_PATH];
+            strncpy(pBuf, candidates[i], sizeof(pBuf) - 1);
+            pBuf[sizeof(pBuf) - 1] = '\0';
+            for (char* p = pBuf; *p; p++) {
+                if (*p == '\\') *p = '/';
+            }
+            if (pBuf[1] == ':') {
+                snprintf(fontOpt, sizeof(fontOpt), "fontfile='%c\\:%s':", pBuf[0], pBuf + 2);
+            } else {
+                snprintf(fontOpt, sizeof(fontOpt), "fontfile='%s':", pBuf);
+            }
+            return fontOpt;
+        }
+    }
+    fontOpt[0] = '\0';
+    return fontOpt;
+}
+
+static int g_has_nvenc = -1; // -1: 未探測, 0: 不支援, 1: 支援
+
+static int DetectNvencSupport(const char* ffmpeg_path) {
+    if (g_has_nvenc != -1) return g_has_nvenc;
+
+    // 1. 微秒級 DLL 檢查 (若系統無 nvcuda.dll 則 100% 無 NVIDIA 顯卡)
+    HMODULE hCuda = LoadLibraryA("nvcuda.dll");
+    if (!hCuda) {
+        g_has_nvenc = 0;
+        LogRec("[NVENC_DETECT] nvcuda.dll not found, fallback to CPU libx264.");
+        return 0;
+    }
+    FreeLibrary(hCuda);
+
+    // 2. 0.01 秒極輕量編碼器測試 (驗證顯卡晶片是否真實支援 NVENC)
+    char probeCmd[MAX_PATH * 2];
+    snprintf(probeCmd, sizeof(probeCmd), "\"%s\" -hide_banner -f lavfi -i color=c=black:s=64x64:d=0.01 -c:v h264_nvenc -f null -", ffmpeg_path);
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+
+    if (CreateProcessA(NULL, probeCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        DWORD waitRes = WaitForSingleObject(pi.hProcess, 1500);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        if (waitRes == WAIT_OBJECT_0 && exitCode == 0) {
+            g_has_nvenc = 1;
+            LogRec("[NVENC_DETECT] NVENC Hardware Acceleration is AVAILABLE! GPU encoding enabled.");
+            return 1;
+        }
+    }
+
+    g_has_nvenc = 0;
+    LogRec("[NVENC_DETECT] NVENC probe failed or unsupported. Fallback to CPU libx264.");
+    return 0;
+}
+
+static void StartNativeRecording(int start_f, int end_f, int scale_mode, const char* ffmpeg_path, const char* out_mp4, const char* p1, const char* p2, int show_osd) {
+    if (g_bNativeRecording) {
+        LogRec("Recording already in progress, ignoring duplicate start.");
+        return;
+    }
+
+    g_rec_show_osd = show_osd;
+    g_bManualPaused = FALSE; // 強制解除底層暫停狀態，確保幀數正常推進
+    if (p1 && strlen(p1) > 0) strncpy(g_rec_p1_name, p1, sizeof(g_rec_p1_name) - 1);
+    else strncpy(g_rec_p1_name, "Player 1", sizeof(g_rec_p1_name) - 1);
+    if (p2 && strlen(p2) > 0) strncpy(g_rec_p2_name, p2, sizeof(g_rec_p2_name) - 1);
+    else strncpy(g_rec_p2_name, "Player 2", sizeof(g_rec_p2_name) - 1);
+
+    LogRec("StartNativeRecording requested: start_f=%d, end_f=%d, scale=%d, ffmpeg=%s, out=%s, P1=%s, P2=%s, OSD=%d",
+        start_f, end_f, scale_mode, ffmpeg_path, out_mp4, g_rec_p1_name, g_rec_p2_name, g_rec_show_osd);
+
+    if (GetFileAttributesA(ffmpeg_path) == INVALID_FILE_ATTRIBUTES) {
+        LogRec("ERROR: Provided ffmpeg path not accessible: %s", ffmpeg_path);
+        return;
+    }
+    strncpy(g_rec_ffmpeg_path, ffmpeg_path, sizeof(g_rec_ffmpeg_path) - 1);
+
+    if (!g_exe_base) DetectExeBase();
+    if (!g_exe_base) {
+        LogRec("ERROR: DetectExeBase failed!");
+        return;
+    }
+
+    int w = 0, h = 0;
+    DetectGameResolution(&w, &h);
+    g_rec_width = w;
+    g_rec_height = h;
+
+    // 【夥伴關鍵補強 1】：動態物理時脈幀率自動推導 (天才算法: 44100 / soundLen)
+    // NeoGeo(745 samples) -> 59.1946 Hz, CPS2(740) -> 59.5946 Hz, 60Hz(735) -> 60.0000 Hz
+    // 【P0-2 修復】: 加入 IsBadReadPtr 邊界保護，防止未初始化分頁引發 0xC0000005 崩潰
+    int soundLen = 735;
+    int* pSoundLen = (int*)GetHostPtrByVa(0x03121af8);
+    if (pSoundLen && !IsBadReadPtr(pSoundLen, 4)) {
+        if (*pSoundLen > 500 && *pSoundLen < 1500) {
+            soundLen = *pSoundLen;
+        }
+    }
+    double real_fps = 44100.0 / (double)soundLen;
+    LogRec("Game native resolution: %dx%d | SoundLen: %d | Dynamic Hardware FPS: %.4f Hz", w, h, soundLen, real_fps);
+
+    g_rec_start_frame = start_f;
+    g_rec_end_frame = end_f;
+    g_rec_is_full = (end_f <= 0);
+    g_rec_scale_mode = scale_mode;
+    g_rec_frames_written = 0;
+    g_rec_has_reached_start = 0;
+    g_rec_need_seek_back = 0;
+    g_rec_audio_bytes = 0;
+    g_rec_attempts = 0;
+    strncpy(g_rec_out_mp4, out_mp4, sizeof(g_rec_out_mp4) - 1);
+
+    // 1. 產生暫存檔路徑 (temp_v.mp4 與 temp_a.wav)
+    DWORD tick = GetTickCount();
+    // 暫存檔放在「輸出 MP4 同一資料夾」(該資料夾必定存在，由 GUI 事先建立)
+    char out_dir[MAX_PATH] = {0};
+    strncpy(out_dir, g_rec_out_mp4, sizeof(out_dir) - 1);
+    {
+        char* s1 = strrchr(out_dir, '\\');
+        char* s2 = strrchr(out_dir, '/');
+        char* sep = (s1 > s2) ? s1 : s2;
+        if (sep) *(sep + 1) = '\0'; else out_dir[0] = '\0';
+    }
+    if (out_dir[0]) {
+        CreateDirectoryA(out_dir, NULL);
+    }
+    snprintf(g_rec_temp_v_mp4, sizeof(g_rec_temp_v_mp4), "%stemp_v_%lu.mp4", out_dir, tick);
+    snprintf(g_rec_temp_a_wav, sizeof(g_rec_temp_a_wav), "%stemp_a_%lu.wav", out_dir, tick);
+    LogRec("Temp files: %s | %s", g_rec_temp_v_mp4, g_rec_temp_a_wav);
+
+    // 2. 建立音訊暫存 WAV 檔並預留 44 bytes Header
+    g_hAudioFile = CreateFileA(g_rec_temp_a_wav, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_hAudioFile != INVALID_HANDLE_VALUE) {
+        WriteWavHeader(g_hAudioFile, 0); // 先寫空白 Header，收尾時回填
+    } else {
+        LogRec("ERROR: Failed to create temp_a.wav! Err=%lu", GetLastError());
+    }
+
+    // 3. 建立視訊專屬唯一具名管道 (單管道 100% 絕不死結！)
+    snprintf(g_rec_pipe_v_name, sizeof(g_rec_pipe_v_name), "\\\\.\\pipe\\fbneo_v_%lu", tick);
+    g_hPipeVideo = CreateNamedPipeA(
+        g_rec_pipe_v_name,
+        PIPE_ACCESS_OUTBOUND,
+        PIPE_TYPE_BYTE | PIPE_WAIT,
+        1, 4 * 1024 * 1024, 4 * 1024 * 1024, 0, NULL);
+
+    if (g_hPipeVideo == INVALID_HANDLE_VALUE) {
+        LogRec("ERROR: CreateNamedPipe failed for video! Err=%lu", GetLastError());
+        if (g_hAudioFile != INVALID_HANDLE_VALUE) { CloseHandle(g_hAudioFile); g_hAudioFile = INVALID_HANDLE_VALUE; }
+        return;
+    }
+
+    // 先啟動視訊監聽執行緒
+    g_bPipeVConnected = 0;
+    g_hThreadV = CreateThread(NULL, 0, PipeThreadV, NULL, 0, NULL);
+
+    // 4. 啟動單管道 FFmpeg 純視訊轉碼進程 (精確帶入動態硬體幀率 %.4f！)
+    // 【P1-3 修復】: 擴展緩衝區容量至 8192/4096，徹底杜絕長路徑或多層濾鏡引發的截斷崩潰！
+    char cmdLine[8192];
+    char osdFilter[4096] = {0};
+
+    // 只有在 720P 或 1080P 且啟用現代條狀 HUD (show_osd == 1) 時才注入 FFmpeg 濾鏡！
+    // 原生 1x 解析度絕不注入 1080p/720p 巨型濾鏡，而是由底層 DrawStringBGRA 繪製 8x8 點陣字，杜絕遮擋血條！
+    if (g_rec_show_osd == 1 && g_rec_res_mode > 1) {
+        char p1_n[64] = "Player 1", p2_n[64] = "Player 2";
+        SafeGetPlayerName(0x0202FEB8, p1_n, sizeof(p1_n), "Player 1");
+        SafeGetPlayerName(0x0202F080, p2_n, sizeof(p2_n), "Player 2");
+        for (char* c = p1_n; *c; c++) { if (*c == 34 || *c == 39 || *c == ':' || *c == 92 || *c == '%' || (unsigned char)*c < 32) *c = ' '; }
+        for (char* c = p2_n; *c; c++) { if (*c == 34 || *c == 39 || *c == ':' || *c == 92 || *c == '%' || (unsigned char)*c < 32) *c = ' '; }
+
+        static const char* s_rank_names[] = { "?", "E", "D", "C", "B", "A", "S" };
+        static const char* s_rank_colors[] = { "0x757575", "0xC27A3F", "0xB3B2B0", "0xF3C84A", "0x00A9DA", "0xA047B2", "0xE54875" };
+        int r1_idx = 0, r2_idx = 0;
+        int* pR1 = (int*)GetHostPtrByVa(0x02030828);
+        int* pR2 = (int*)GetHostPtrByVa(0x0202F9F0);
+        if (pR1 && !IsBadReadPtr(pR1, 4)) r1_idx = *pR1;
+        if (pR2 && !IsBadReadPtr(pR2, 4)) r2_idx = *pR2;
+        if (r1_idx < 0 || r1_idx > 6) r1_idx = 0;
+        if (r2_idx < 0 || r2_idx > 6) r2_idx = 0;
+
+        int match_ft_val = 0;
+        int* pFt = (int*)GetHostPtrByVa(0x0312DBD0);
+        if (pFt && !IsBadReadPtr(pFt, 4)) match_ft_val = *pFt;
+
+        char ft_disp[32] = "VS";
+        if (match_ft_val > 1) {
+            snprintf(ft_disp, sizeof(ft_disp), "FT%d", match_ft_val);
+        }
+
+        int s1 = 0, s2 = 0;
+        int* pScoreP1 = (int*)GetHostPtrByVa(0x03183210);
+        int* pScoreP2 = (int*)GetHostPtrByVa(0x03183214);
+        if (pScoreP1 && pScoreP2 && !IsBadReadPtr(pScoreP1, 4) && !IsBadReadPtr(pScoreP2, 4)) {
+            s1 = *pScoreP1;
+            s2 = *pScoreP2;
+        }
+
+        int p1_w = SafeCalcTextWidth24(p1_n);
+        int p2_w = SafeCalcTextWidth24(p2_n);
+        const char* fOpt = GetSafeFontOpt();
+
+        if (g_rec_res_mode == 2) {
+            // 【720P 高清 (1280x720) 條狀 HUD 自適應】
+            // 字級 16px、基準 y=12、半透明黑條 480x32、中心點 x=640
+            int p1_w16 = p1_w * 16 / 24;
+            int p2_w16 = p2_w * 16 / 24;
+            char p1_rank_opt[256] = {0};
+            char p2_rank_opt[256] = {0};
+            if (r1_idx > 0) {
+                snprintf(p1_rank_opt, sizeof(p1_rank_opt),
+                    ",drawtext=%stext='%s':x=640-50-%d-text_w:y=12:fontsize=16:fontcolor=%s:borderw=1:bordercolor=black",
+                    fOpt, s_rank_names[r1_idx], p1_w16 + 6, s_rank_colors[r1_idx]);
+            }
+            if (r2_idx > 0) {
+                snprintf(p2_rank_opt, sizeof(p2_rank_opt),
+                    ",drawtext=%stext='%s':x=640+50+%d:y=12:fontsize=16:fontcolor=%s:borderw=1:bordercolor=black",
+                    fOpt, s_rank_names[r2_idx], p2_w16 + 6, s_rank_colors[r2_idx]);
+            }
+            snprintf(osdFilter, sizeof(osdFilter),
+                ",drawbox=x=(1280-480)/2:y=6:w=480:h=32:color=0x201C24@0.70:t=fill"
+                "%s"
+                ",drawtext=%stext='%s':x=640-50-text_w:y=12:fontsize=16:fontcolor=white:borderw=1:bordercolor=black"
+                ",drawtext=%stext='%d':x=640-30-text_w:y=12:fontsize=16:fontcolor=0x66E9E0:borderw=1:bordercolor=black"
+                ",drawtext=%stext='%s':x=(w-text_w)/2:y=12:fontsize=16:fontcolor=0x838584:borderw=1:bordercolor=black"
+                ",drawtext=%stext='%d':x=640+30:y=12:fontsize=16:fontcolor=0x66E9E0:borderw=1:bordercolor=black"
+                ",drawtext=%stext='%s':x=640+50:y=12:fontsize=16:fontcolor=white:borderw=1:bordercolor=black"
+                "%s",
+                p1_rank_opt, fOpt, p1_n, fOpt, s1, fOpt, ft_disp, fOpt, s2, fOpt, p2_n, p2_rank_opt);
+        } else if (g_rec_res_mode == 4) {
+            // 【1440P 2K 超清 (2560x1440) 條狀 HUD】
+            // 字級 32px、基準 y=24、半透明黑條 960x62、中心點 x=1280
+            int p1_w32 = p1_w * 32 / 24;
+            int p2_w32 = p2_w * 32 / 24;
+            char p1_rank_opt[256] = {0};
+            char p2_rank_opt[256] = {0};
+            if (r1_idx > 0) {
+                snprintf(p1_rank_opt, sizeof(p1_rank_opt),
+                    ",drawtext=%stext='%s':x=1280-100-%d-text_w:y=24:fontsize=32:fontcolor=%s:borderw=2:bordercolor=black",
+                    fOpt, s_rank_names[r1_idx], p1_w32 + 10, s_rank_colors[r1_idx]);
+            }
+            if (r2_idx > 0) {
+                snprintf(p2_rank_opt, sizeof(p2_rank_opt),
+                    ",drawtext=%stext='%s':x=1280+100+%d:y=24:fontsize=32:fontcolor=%s:borderw=2:bordercolor=black",
+                    fOpt, s_rank_names[r2_idx], p2_w32 + 10, s_rank_colors[r2_idx]);
+            }
+            snprintf(osdFilter, sizeof(osdFilter),
+                ",drawbox=x=(2560-960)/2:y=10:w=960:h=62:color=0x201C24@0.70:t=fill"
+                "%s"
+                ",drawtext=%stext='%s':x=1280-100-text_w:y=24:fontsize=32:fontcolor=white:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%d':x=1280-60-text_w:y=24:fontsize=32:fontcolor=0x66E9E0:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%s':x=(w-text_w)/2:y=24:fontsize=32:fontcolor=0x838584:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%d':x=1280+60:y=24:fontsize=32:fontcolor=0x66E9E0:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%s':x=1280+100:y=24:fontsize=32:fontcolor=white:borderw=2:bordercolor=black"
+                "%s",
+                p1_rank_opt, fOpt, p1_n, fOpt, s1, fOpt, ft_disp, fOpt, s2, fOpt, p2_n, p2_rank_opt);
+        } else {
+            // 【1080P 全高清 (1920x1080) 條狀 HUD】
+            char p1_rank_opt[256] = {0};
+            char p2_rank_opt[256] = {0};
+            if (r1_idx > 0) {
+                snprintf(p1_rank_opt, sizeof(p1_rank_opt),
+                    ",drawtext=%stext='%s':x=960-75-%d-text_w:y=18:fontsize=24:fontcolor=%s:borderw=2:bordercolor=black",
+                    fOpt, s_rank_names[r1_idx], p1_w + 8, s_rank_colors[r1_idx]);
+            }
+            if (r2_idx > 0) {
+                snprintf(p2_rank_opt, sizeof(p2_rank_opt),
+                    ",drawtext=%stext='%s':x=960+75+%d:y=18:fontsize=24:fontcolor=%s:borderw=2:bordercolor=black",
+                    fOpt, s_rank_names[r2_idx], p2_w + 8, s_rank_colors[r2_idx]);
+            }
+            snprintf(osdFilter, sizeof(osdFilter),
+                ",drawbox=x=(1920-720)/2:y=8:w=720:h=46:color=0x201C24@0.70:t=fill"
+                "%s"
+                ",drawtext=%stext='%s':x=960-75-text_w:y=18:fontsize=24:fontcolor=white:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%d':x=960-45-text_w:y=18:fontsize=24:fontcolor=0x66E9E0:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%s':x=(w-text_w)/2:y=18:fontsize=24:fontcolor=0x838584:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%d':x=960+45:y=18:fontsize=24:fontcolor=0x66E9E0:borderw=2:bordercolor=black"
+                ",drawtext=%stext='%s':x=960+75:y=18:fontsize=24:fontcolor=white:borderw=2:bordercolor=black"
+                "%s",
+                p1_rank_opt, fOpt, p1_n, fOpt, s1, fOpt, ft_disp, fOpt, s2, fOpt, p2_n, p2_rank_opt);
+        }
+    }
+
+    char fullVfOpt[4096];
+    if (g_rec_res_mode == 1) {
+        // 【A1. 原生 1x (街機原生點對點，自動辨識 NEOGEO 320x224 / CPS1~3 384x224 / PGM 448x224)】
+        if (g_rec_render_mode == 0) {
+            // 模式 0: 原廠 AdvanceMAME Scale3x 復刻 (原生微光柵 + 溫和色彩回補 + BT.709 全色度)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"drawgrid=width=iw:height=2:thickness=1:color=black@0.16,eq=saturation=1.18:contrast=1.06:brightness=-0.008,scale=iw:ih:flags=neighbor+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709\"");
+        } else if (g_rec_render_mode == 1) {
+            // 模式 1: 輕微光柵 + 色彩微補償
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"drawgrid=width=iw:height=2:thickness=1:color=black@0.18,eq=saturation=1.08:contrast=1.03,scale=iw:ih:flags=neighbor+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709\"");
+        } else if (g_rec_render_mode == 2) {
+            // 模式 2: 刀鋒微銳化 + 色彩微補償
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"unsharp=3:3:0.4:3:3:0.0,eq=saturation=1.08:contrast=1.03,scale=iw:ih:flags=neighbor+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709\"");
+        } else {
+            // 模式 3: 純淨原汁原味直出 + 溫和色彩微補償
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"eq=saturation=1.08:contrast=1.03,scale=iw:ih:flags=neighbor+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709\"");
+        }
+    } else if (g_rec_res_mode == 2) {
+        // 【A2. 720P 高清 (1280x720，等比居中 960x720 + 兩側補黑邊各 160px)】
+        if (g_rec_render_mode == 0) {
+            // 模式 0: 🕹️ 原廠 AdvanceMAME Scale3x + 像素列對齊掃描線 + Lanczos 無波紋二段縮放
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"epx=n=3,drawgrid=width=iw:height=3:thickness=1:color=black@0.24,scale=960:720:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.35:3:3:0.0,eq=saturation=1.18:contrast=1.08:brightness=-0.01,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else if (g_rec_render_mode == 1) {
+            // 模式 1: 📺 CRT 顯像管等比光柵 (3x Prescale + 像素對齊光柵 + Lanczos + 微銳化)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=iw*3:ih*3:flags=neighbor,drawgrid=width=iw:height=3:thickness=1:color=black@0.26,scale=960:720:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.4:3:3:0.0,eq=saturation=1.08:contrast=1.03,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else if (g_rec_render_mode == 2) {
+            // 模式 2: ⚡ 刀鋒無損硬點陣 (3x Prescale + Lanczos + 0.6 刀鋒電競銳化)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=iw*3:ih*3:flags=neighbor,scale=960:720:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.6:3:3:0.0,eq=saturation=1.08:contrast=1.03,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else {
+            // 模式 3: 🕹️ 柔和雙立方抗鋸齒 (Bicubic 平滑縮放)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=960:720:flags=bicubic+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,eq=saturation=1.08:contrast=1.03,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        }
+    } else if (g_rec_res_mode == 4) {
+        // 【A4. 1440P 2K 超清 (2560x1440，等比居中 1920x1440 + 兩側補黑邊各 320px，YouTube 強制 VP9 專項)】
+        if (g_rec_render_mode == 0) {
+            // 模式 0: 🕹️ 原廠 AdvanceMAME Scale3x + 像素列對齊掃描線 + Lanczos 2K 超清縮放
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"epx=n=3,drawgrid=width=iw:height=3:thickness=1:color=black@0.26,scale=1920:1440:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.40:3:3:0.0,eq=saturation=1.18:contrast=1.08:brightness=-0.01,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else if (g_rec_render_mode == 1) {
+            // 模式 1: 📺 CRT 顯像管等比光柵 (6x Prescale + 像素對齊光柵 + Lanczos 2K)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=iw*6:ih*6:flags=neighbor,drawgrid=width=iw:height=6:thickness=2:color=black@0.28,scale=1920:1440:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.45:3:3:0.0,eq=saturation=1.08:contrast=1.03,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else if (g_rec_render_mode == 2) {
+            // 模式 2: ⚡ 刀鋒無損硬點陣 (6x Prescale + Lanczos 2K + 0.65 刀鋒電競銳化)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=iw*6:ih*6:flags=neighbor,scale=1920:1440:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.65:3:3:0.0,eq=saturation=1.08:contrast=1.03,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else {
+            // 模式 3: 🕹️ 柔和雙立方抗鋸齒 (Bicubic 2K 平滑縮放)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=1920:1440:flags=bicubic+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,eq=saturation=1.08:contrast=1.03,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        }
+    } else {
+        // 【A3. 1080P 全高清 (1920x1080，等比居中 1440x1080 + 兩側補黑邊各 240px)】
+        if (g_rec_render_mode == 0) {
+            // 模式 0: 🕹️ 原廠 AdvanceMAME Scale3x + 像素列對齊掃描線 + Lanczos 無波紋二段縮放 [原廠 1:1 復刻升級版]
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"epx=n=3,drawgrid=width=iw:height=3:thickness=1:color=black@0.26,scale=1440:1080:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.35:3:3:0.0,eq=saturation=1.18:contrast=1.08:brightness=-0.01,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else if (g_rec_render_mode == 1) {
+            // 模式 1: 📺 CRT 顯像管等比光柵 (4x Prescale + 像素對齊光柵 + Lanczos + 微銳化)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=iw*4:ih*4:flags=neighbor,drawgrid=width=iw:height=4:thickness=1:color=black@0.28,scale=1440:1080:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.4:3:3:0.0,eq=saturation=1.08:contrast=1.03,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else if (g_rec_render_mode == 2) {
+            // 模式 2: ⚡ 刀鋒無損硬點陣 (4x Prescale + Lanczos + 0.6 刀鋒電競銳化)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=iw*4:ih*4:flags=neighbor,scale=1440:1080:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,unsharp=3:3:0.6:3:3:0.0,eq=saturation=1.08:contrast=1.03,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        } else {
+            // 模式 3: 🕹️ 柔和雙立方抗鋸齒 (Bicubic 平滑縮放)
+            snprintf(fullVfOpt, sizeof(fullVfOpt), "-vf \"scale=1440:1080:flags=bicubic+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709,eq=saturation=1.08:contrast=1.03,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black%s\"", osdFilter);
+        }
+    }
+
+    int use_nvenc = DetectNvencSupport(g_rec_ffmpeg_path);
+    const char* enc_opts = use_nvenc ?
+        "-c:v h264_nvenc -preset p5 -tune hq -rc vbr -cq 16 -b:v 0 -g 60 -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709" :
+        "-c:v libx264 -preset fast -crf 16 -aq-mode 2 -g 60 -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709";
+
+    snprintf(cmdLine, sizeof(cmdLine),
+        "\"%s\" -y "
+        "-probesize 32 -analyzeduration 0 "
+        "-f rawvideo -pixel_format bgra -video_size %dx%d -framerate %.4f -i %s "
+        "%s "
+        "%s "
+        "-an \"%s\"",
+        g_rec_ffmpeg_path, w, h, real_fps, g_rec_pipe_v_name, fullVfOpt, enc_opts, g_rec_temp_v_mp4);
+
+    LogRec("Spawning Enhanced Single-Pipe FFmpeg: %s", cmdLine);
+
+    char ffLogPath[MAX_PATH];
+    snprintf(ffLogPath, sizeof(ffLogPath), "%sffmpeg_run.log", g_module_dir);
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hLog = CreateFileA(ffLogPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | (hLog != INVALID_HANDLE_VALUE ? STARTF_USESTDHANDLES : 0);
+    si.wShowWindow = SW_HIDE;
+    if (hLog != INVALID_HANDLE_VALUE) {
+        si.hStdOutput = hLog;
+        si.hStdError = hLog;
+    }
+
+    memset(&g_ffmpeg_pi, 0, sizeof(g_ffmpeg_pi));
+    BOOL cp_ok = CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &g_ffmpeg_pi);
+    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+    if (!cp_ok) {
+        DWORD err = GetLastError();
+        LogRec("CRITICAL: Failed to spawn FFmpeg process! err=%lu, cmdLine=%s", err, cmdLine);
+        StopNativeRecording("SPAWN_FFMPEG_FAIL");
+        return;
+    }
+
+    if (!cp_ok) {
+        LogRec("ERROR: CreateProcess failed for FFmpeg! Err=%lu", GetLastError());
+        CloseHandle(g_hPipeVideo); g_hPipeVideo = INVALID_HANDLE_VALUE;
+        if (g_hAudioFile != INVALID_HANDLE_VALUE) { CloseHandle(g_hAudioFile); g_hAudioFile = INVALID_HANDLE_VALUE; }
+        return;
+    }
+
+    g_bNativeRecording = 1;
+    LogRec("Route A with Partner Enhancements successfully started!");
+    EnableTurboFullRender(1);
+}
+
 __declspec(dllexport) int lua_poll_gui_cmd(void* L) {
     if (!p_lua_pushinteger) InitRealDll();
     if (!p_lua_pushinteger || !L) return 0;
@@ -2306,14 +3463,123 @@ __declspec(dllexport) int lua_poll_gui_cmd(void* L) {
     int cmd_code = 0;
     int cmd_val  = 0;
 
-    char cmd_path[MAX_PATH] = {0};
-    snprintf(cmd_path, sizeof(cmd_path), "%sscripts\\ipc_cmd.txt", g_module_dir);
+    static char cmd_path[MAX_PATH] = {0};
+    if (!cmd_path[0]) {
+        snprintf(cmd_path, sizeof(cmd_path), "%sscripts\\ipc_cmd.txt", g_module_dir);
+    }
 
+    // 【極速空檔案短路】：先由系統快取檢查檔案大小，若為 0 bytes 則直接返回，徹底消除每秒數百次 fopen/fclose！
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(cmd_path, GetFileExInfoStandard, &fad) ||
+        (fad.nFileSizeLow == 0 && fad.nFileSizeHigh == 0)) {
+        p_lua_pushinteger(L, 0);
+        p_lua_pushinteger(L, 0);
+        return 2;
+    }
+
+    int need_clear_file = 0;
     FILE* fp = fopen(cmd_path, "r");
     if (fp) {
-        char buf[128] = {0};
+        char buf[512] = {0};
         if (fgets(buf, sizeof(buf) - 1, fp)) {
-            if (strncmp(buf, "PROBE_EOF", 9) == 0) {
+            if (strncmp(buf, "REC_START ", 10) == 0) {
+                int s_f = 0, e_f = 0, sc_m = 0;
+                char* rest = NULL;
+                if (sscanf(buf + 10, "%d %d %d", &s_f, &e_f, &sc_m) == 3) {
+                    rest = buf + 10;
+                    for (int i = 0; i < 3; i++) {
+                        while (*rest && *rest != ' ') rest++;
+                        while (*rest && *rest == ' ') rest++;
+                    }
+                    char* pipe_sep = strchr(rest, '|');
+                    if (pipe_sep) {
+                        *pipe_sep = '\0';
+                        char* ff_p = rest;
+                        char* out_p = pipe_sep + 1;
+                        char* nl = strpbrk(out_p, "\r\n");
+                        if (nl) *nl = '\0';
+                        if (s_f <= 0) s_f = 30; // 街機開局錨點保護
+                        char* p1_name = "Player 1";
+                        char* p2_name = "Player 2";
+                        int show_osd = 1;
+                        char* osd_sep = NULL;
+                        char* p1_sep = strchr(out_p, '|');
+                        if (p1_sep) {
+                            *p1_sep = '\0';
+                            p1_name = p1_sep + 1;
+                            char* p2_sep = strchr(p1_name, '|');
+                            if (p2_sep) {
+                                *p2_sep = '\0';
+                                p2_name = p2_sep + 1;
+                                osd_sep = strchr(p2_name, '|');
+                                if (osd_sep) {
+                                    *osd_sep = '\0';
+                                    show_osd = atoi(osd_sep + 1);
+                                }
+                            }
+                        }
+                        char* nl1 = strpbrk(p1_name, "\r\n"); if (nl1) *nl1 = '\0';
+                        char* nl2 = strpbrk(p2_name, "\r\n"); if (nl2) *nl2 = '\0';
+
+                        if (osd_sep) {
+                            char* r1_sep = strchr(osd_sep + 1, '|');
+                            if (r1_sep) {
+                                *r1_sep = '\0';
+                                char* r1_val = r1_sep + 1;
+                                char* r2_sep = strchr(r1_val, '|');
+                                if (r2_sep) {
+                                    *r2_sep = '\0';
+                                    char* r2_val = r2_sep + 1;
+                                    char* ft_sep = strchr(r2_val, '|');
+                                    if (ft_sep) {
+                                        *ft_sep = '\0';
+                                        char* ft_val = ft_sep + 1;
+                                        char* tb_sep = strchr(ft_val, '|');
+                                        if (tb_sep) {
+                                            *tb_sep = '\0';
+                                            char* tb_val = tb_sep + 1;
+                                            char* rm_sep = strchr(tb_val, '|');
+                                            if (rm_sep) {
+                                                *rm_sep = '\0';
+                                                char* rm_val = rm_sep + 1;
+                                                g_rec_render_mode = atoi(rm_val);
+                                                g_rec_res_mode = sc_m;
+                                            } else {
+                                                // 舊版指令相容邏輯 (0=1080柔和, 1=1080光柵, 2=1080刀鋒, 3=1x原生)
+                                                if (sc_m == 3) { g_rec_res_mode = 1; g_rec_render_mode = 2; }
+                                                else if (sc_m == 1) { g_rec_res_mode = 3; g_rec_render_mode = 1; }
+                                                else if (sc_m == 2) { g_rec_res_mode = 3; g_rec_render_mode = 2; }
+                                                else { g_rec_res_mode = 3; g_rec_render_mode = 0; }
+                                            }
+                                            g_rec_is_turbo = atoi(tb_val);
+                                        } else {
+                                            g_rec_is_turbo = 0;
+                                            if (sc_m == 3) { g_rec_res_mode = 1; g_rec_render_mode = 2; }
+                                            else { g_rec_res_mode = 3; g_rec_render_mode = 1; }
+                                        }
+                                        strncpy(g_rec_match_ft, ft_val, sizeof(g_rec_match_ft) - 1);
+                                        g_rec_match_ft[sizeof(g_rec_match_ft) - 1] = '\0';
+                                        g_rec_scale_mode = g_rec_res_mode;
+                                    } else {
+                                        g_rec_is_turbo = 0;
+                                    }
+                                    strncpy(g_rec_p2_rank, r2_val, sizeof(g_rec_p2_rank) - 1);
+                                    g_rec_p2_rank[sizeof(g_rec_p2_rank) - 1] = '\0';
+                                }
+                                strncpy(g_rec_p1_rank, r1_val, sizeof(g_rec_p1_rank) - 1);
+                                g_rec_p1_rank[sizeof(g_rec_p1_rank) - 1] = '\0';
+                            }
+                        }
+
+                        StartNativeRecording(s_f, e_f, sc_m, ff_p, out_p, p1_name, p2_name, show_osd);
+                        cmd_code = 1; // 確保一定清空 ipc_cmd.txt 並執行 Seek
+                        cmd_val  = s_f;
+                    }
+                }
+            } else if (strncmp(buf, "REC_STOP", 8) == 0) {
+                StopNativeRecording("IPC_REC_STOP");
+                need_clear_file = 1;
+            } else if (strncmp(buf, "PROBE_EOF", 9) == 0) {
                 cmd_code = 5;
                 cmd_val  = 0;
             } else if (strncmp(buf, "FFWD", 4) == 0) {
@@ -2334,7 +3600,10 @@ __declspec(dllexport) int lua_poll_gui_cmd(void* L) {
             }
         }
         fclose(fp);
-        if (cmd_code != 0) {
+        if (cmd_code != 0 || need_clear_file) {
+            if (cmd_code == 1 || cmd_code == 3 || cmd_code == 4 || cmd_code == 5 || cmd_code == 6) {
+                g_bManualPaused = FALSE;
+            }
             FILE* fpw = fopen(cmd_path, "w");
             if (fpw) fclose(fpw);
         }
@@ -2345,30 +3614,457 @@ __declspec(dllexport) int lua_poll_gui_cmd(void* L) {
     return 2;
 }
 
-// 接收 Lua 傳入的 (cur_frame, max_frame, is_eof, state_code, target_frame) 並寫入 scripts\ipc_state.txt
-// state_code: 0=正常播放, 1=已暫停, 2=極速快進中, 3=播畢定格
+__declspec(dllexport) int lua_is_turbo_rec(void* L) {
+    if (!p_lua_pushinteger) InitRealDll();
+    if (!p_lua_pushinteger || !L) return 0;
+    int active = (g_bNativeRecording && g_rec_is_turbo && g_rec_has_reached_start) ? 1 : 0;
+    p_lua_pushinteger(L, active);
+    return 1;
+}
+
 __declspec(dllexport) int lua_update_gui_state(void* L) {
-    if (!p_lua_tointeger) InitRealDll();
-    if (!p_lua_tointeger || !L) return 0;
+    if (!p_lua_tointeger) return 0;
 
     int cur_f    = (int)p_lua_tointeger(L, 1);
     int max_f    = (int)p_lua_tointeger(L, 2);
     int is_eof   = (int)p_lua_tointeger(L, 3);
     int state_c  = (int)p_lua_tointeger(L, 4);
     int target_f = (int)p_lua_tointeger(L, 5);
+    int lua_w    = (int)p_lua_tointeger(L, 6);
+    int lua_h    = (int)p_lua_tointeger(L, 7);
+    int force_fl = (p_lua_gettop && p_lua_gettop(L) >= 8) ? (int)p_lua_tointeger(L, 8) : 0;
+    if (lua_w > 0 && lua_h > 0) {
+        g_game_width = lua_w;
+        g_game_height = lua_h;
+        if (!g_bNativeRecording) {
+            g_rec_width = lua_w;
+            g_rec_height = lua_h;
+        }
+    } else if (!g_bNativeRecording) {
+        int dw = 0, dh = 0;
+        DetectGameResolution(&dw, &dh);
+        g_game_width = dw;
+        g_game_height = dh;
+        g_rec_width = dw;
+        g_rec_height = dh;
+    }
 
     g_last_lua_state_tick = GetTickCount();
+    g_rec_last_cur_frame = cur_f;
 
-    char st_path[MAX_PATH] = {0};
-    snprintf(st_path, sizeof(st_path), "%sscripts\\ipc_state.txt", g_module_dir);
+    if (g_bNativeRecording) {
+        if (!g_rec_has_reached_start) {
+            int ready = g_rec_is_turbo ? (cur_f >= g_rec_start_frame) : (state_c == 0 && cur_f >= g_rec_start_frame);
+            if (ready) {
+                g_rec_has_reached_start = 1;
+                LogRec("Playback reached start frame (cur_f=%d >= start=%d, state=%d, turbo=%d), streaming active!", cur_f, g_rec_start_frame, state_c, g_rec_is_turbo);
+            }
+        }
 
-    FILE* fp = fopen(st_path, "w");
-    if (fp) {
-        fprintf(fp, "%d %d %d %d %d\n", cur_f, max_f, is_eof, state_c, target_f);
-        fclose(fp);
+        if (g_rec_has_reached_start && g_exe_base) {
+            // 1. 視訊單管道傳輸 (60 FPS 幀幀直通)；只有「真的寫入成功」才算一幀
+            int vid_ok = 0;
+            int d_w = g_rec_width;
+            int d_h = g_rec_height;
+            int d_bpp = *(int*)GetHostPtrByVa(0x03173bb0);
+            const void* d_pDraw = *(const void**)GetHostPtrByVa(0x03173bb4);
+            if (g_bPipeVConnected) {
+                int w = d_w;
+                int h = d_h;
+                int bpp = d_bpp;
+                int maskType = *(int*)GetHostPtrByVa(0x03173bac);
+                const void* pDraw = d_pDraw;
+
+                if (pDraw && w > 0 && h > 0 && (bpp == 2 || bpp == 4)) {
+                    // 【精確行跨距】直接讀取 FBNeo 核心 nBurnPitch (0x03173b98)
+                    // CPS3 (384x224): 384 * 2 = 768 bytes; NeoGeo (320x224): 320 * 2 = 640 bytes
+                    int pitch = *(int*)GetHostPtrByVa(0x03173b98);
+                    if (pitch <= 0 || pitch < w * (bpp == 4 ? 4 : 2)) {
+                        pitch = w * (bpp == 4 ? 4 : 2);
+                    }
+                    size_t req_bytes = (size_t)w * h * 4;
+                    size_t src_req_bytes = (size_t)pitch * (h > 0 ? (h - 1) : 0) + (size_t)w * (bpp == 4 ? 4 : 2);
+
+                    if (g_rec_bgra_cap < req_bytes) {
+                        if (g_rec_bgra_buf) free(g_rec_bgra_buf);
+                        g_rec_bgra_buf = (uint32_t*)malloc(req_bytes);
+                        g_rec_bgra_cap = req_bytes;
+                    }
+
+                    if (g_rec_bgra_buf) {
+                        // 【金鐘罩防護】：嚴格驗證 pDraw 包含 row-pitch 的完整可讀記憶體頁面
+                        // 徹底解決 CPS1/2/3 顯存行跨距錯位導致的花屏！
+                        if (!IsBadReadPtr(pDraw, src_req_bytes)) {
+                            ConvertToBGRA32(pDraw, g_rec_bgra_buf, w, h, pitch, bpp, maskType);
+                        } else {
+                            // 瞬態記憶體未就緒 (如 Seek/轉場瞬間)：填入純黑畫面，保證串流時間軸絕對連續不掉幀
+                            memset(g_rec_bgra_buf, 0, req_bytes);
+                            for (size_t px = 0; px < (size_t)w * h; px++) {
+                                g_rec_bgra_buf[px] = 0xFF000000;
+                            }
+                        }
+
+                        // 繪製頂部比賽 OSD 資訊浮層 (即時動態比分與雙選手 ID)
+                        // g_rec_show_osd: 0=關閉, 1=原汁原味細字 (Scale 1), 2=原汁原味大粗字 (Scale 2)
+                        // 100% 比照 Fightcade 原廠色彩與排版: 白色選手ID + 亮青色比分 + 白色 vs (1px 純黑硬陰影，無黑條)
+                        if (((g_rec_res_mode == 1 && g_rec_show_osd != 0) || g_rec_show_osd == 2) && g_rec_bgra_buf) { // 原生解析度或顯式選點陣時自動採用 8x8 精準點陣
+                            int scale = 1;
+                            int p1_score = 0, p2_score = 0;
+                            int* pScoreP1 = (int*)GetHostPtrByVa(0x03183210);
+                            int* pScoreP2 = (int*)GetHostPtrByVa(0x03183214);
+                            if (pScoreP1 && pScoreP2 && !IsBadReadPtr(pScoreP1, 4) && !IsBadReadPtr(pScoreP2, 4)) {
+                                p1_score = *pScoreP1;
+                                p2_score = *pScoreP2;
+                            }
+
+                            // 自動原生感測 1P 與 2P 選手名稱 (免手動輸入)
+                            char p1_name[64], p2_name[64];
+                            SafeGetPlayerName(0x0202FEB8, p1_name, sizeof(p1_name), g_rec_p1_name);
+                            SafeGetPlayerName(0x0202F080, p2_name, sizeof(p2_name), g_rec_p2_name);
+
+                            // 原廠配色定義 (取樣自官方 FBNeo 畫面)
+                            uint32_t col_gold   = 0xFFFDB813; // 亮金色 (賽制 FT)
+                            uint32_t col_white  = 0xFFFFFFFF; // 純白色 (選手 ID)
+                            uint32_t col_cyan   = 0xFF33F1E5; // 原廠經典亮青藍色 (比分數字)
+                            uint32_t col_shadow = 0xFF000000; // 1px 純黑立體硬陰影
+                            int top_y = 2;
+
+                            char s1[16], s2[16];
+                            snprintf(s1, sizeof(s1), "%d", p1_score);
+                            snprintf(s2, sizeof(s2), "%d", p2_score);
+
+                            // 官方真實段位等級感測: *(int*)0x02030828 (1P) 與 *(int*)0x0202F9F0 (2P)
+                            // 官方 7 大段位色彩 (0xAARRGGBB):
+                            // 0: ?, 1: E (0xC27A3F), 2: D (0xB3B2B0), 3: C (0xF3C84A), 4: B (0x00A9DA), 5: A (0xA047B2), 6: S (0xE54875)
+                            static const char* s_rank_names[] = { "?", "E", "D", "C", "B", "A", "S" };
+                            static const uint32_t s_rank_bgra[] = {
+                                0xFF757575, // 0: ?
+                                0xFFC27A3F, // 1: E (古銅)
+                                0xFFB3B2B0, // 2: D (白銀)
+                                0xFFF3C84A, // 3: C (亮金)
+                                0xFF00A9DA, // 4: B (天藍)
+                                0xFFA047B2, // 5: A (紫晶)
+                                0xFFE54875  // 6: S (赤紅)
+                            };
+
+                            int r1_idx = 0, r2_idx = 0;
+                            int* pR1 = (int*)GetHostPtrByVa(0x02030828);
+                            int* pR2 = (int*)GetHostPtrByVa(0x0202F9F0);
+                            if (pR1 && !IsBadReadPtr(pR1, 4)) r1_idx = *pR1;
+                            if (pR2 && !IsBadReadPtr(pR2, 4)) r2_idx = *pR2;
+                            if (r1_idx < 0 || r1_idx > 6) r1_idx = 0;
+                            if (r2_idx < 0 || r2_idx > 6) r2_idx = 0;
+
+                            char r1_buf[16] = {0};
+                            char r2_buf[16] = {0};
+                            uint32_t col_r1 = 0xFFF3C84A;
+                            uint32_t col_r2 = 0xFF00A9DA;
+
+                            // 1P 段位: 優先從記憶體自動感測；若無且未手動指定有效段位，則完全不顯示（嚴格過濾 NONE / AUTO）
+                            if (r1_idx > 0) {
+                                snprintf(r1_buf, sizeof(r1_buf), "[%s]", s_rank_names[r1_idx]);
+                                col_r1 = s_rank_bgra[r1_idx];
+                            } else if (g_rec_p1_rank[0] && _stricmp(g_rec_p1_rank, "NONE") != 0 && _stricmp(g_rec_p1_rank, "AUTO") != 0 && _stricmp(g_rec_p1_rank, "?") != 0) {
+                                snprintf(r1_buf, sizeof(r1_buf), "[%s]", g_rec_p1_rank);
+                            }
+
+                            // 2P 段位: 同理嚴格過濾
+                            if (r2_idx > 0) {
+                                snprintf(r2_buf, sizeof(r2_buf), "[%s]", s_rank_names[r2_idx]);
+                                col_r2 = s_rank_bgra[r2_idx];
+                            } else if (g_rec_p2_rank[0] && _stricmp(g_rec_p2_rank, "NONE") != 0 && _stricmp(g_rec_p2_rank, "AUTO") != 0 && _stricmp(g_rec_p2_rank, "?") != 0) {
+                                snprintf(r2_buf, sizeof(r2_buf), "[%s]", g_rec_p2_rank);
+                            }
+
+                            const char* ft_str = (g_rec_match_ft[0] ? g_rec_match_ft : "vs");
+
+                            int r1_l = (int)strlen(r1_buf);
+                            int r2_l = (int)strlen(r2_buf);
+                            int ft_l = (int)strlen(ft_str);
+                            int p1_l = (int)strlen(p1_name);
+                            int p2_l = (int)strlen(p2_name);
+                            int s1_l = (int)strlen(s1);
+                            int s2_l = (int)strlen(s2);
+
+                            // 動態居中排版計算 (無段位時不佔寬度，徹底消除 NONE 且保證完美對稱居中)
+                            int total_chars = 0;
+                            if (r1_l > 0) total_chars += (r1_l + 1); // "[C] "
+                            total_chars += p1_l + 2;                // "P1  "
+                            total_chars += s1_l + 2;                // "0  "
+                            total_chars += ft_l + 2;                // "FT10  " 或 "vs  "
+                            total_chars += s2_l + 2;                // "0  "
+                            total_chars += p2_l;                    // "P2"
+                            if (r2_l > 0) total_chars += (1 + r2_l);// " [B]"
+
+                            int start_x = (w - total_chars * 8 * scale) / 2;
+                            if (start_x < 2) start_x = 2;
+
+                            int cur_x = start_x;
+                            // 1. 1P 等級徽章 (若有才繪製)
+                            if (r1_l > 0) {
+                                DrawStringBGRA(g_rec_bgra_buf, w, h, cur_x, top_y, r1_buf, col_r1, col_shadow, scale);
+                                cur_x += (r1_l + 1) * 8 * scale;
+                            }
+
+                            // 2. 1P 選手 ID (純白色)
+                            DrawStringBGRA(g_rec_bgra_buf, w, h, cur_x, top_y, p1_name, col_white, col_shadow, scale);
+                            cur_x += (p1_l + 2) * 8 * scale;
+
+                            // 3. 1P 比數 (亮青色)
+                            DrawStringBGRA(g_rec_bgra_buf, w, h, cur_x, top_y, s1, col_cyan, col_shadow, scale);
+                            cur_x += (s1_l + 2) * 8 * scale;
+
+                            // 4. 原廠賽制標記 (亮金色 FT10 或 vs)
+                            DrawStringBGRA(g_rec_bgra_buf, w, h, cur_x, top_y, ft_str, col_gold, col_shadow, scale);
+                            cur_x += (ft_l + 2) * 8 * scale;
+
+                            // 5. 2P 比數 (亮青色)
+                            DrawStringBGRA(g_rec_bgra_buf, w, h, cur_x, top_y, s2, col_cyan, col_shadow, scale);
+                            cur_x += (s2_l + 2) * 8 * scale;
+
+                            // 6. 2P 選手 ID (純白色)
+                            DrawStringBGRA(g_rec_bgra_buf, w, h, cur_x, top_y, p2_name, col_white, col_shadow, scale);
+                            cur_x += p2_l * 8 * scale;
+
+                            // 7. 2P 等級徽章 (若有才繪製)
+                            if (r2_l > 0) {
+                                cur_x += 1 * 8 * scale;
+                                DrawStringBGRA(g_rec_bgra_buf, w, h, cur_x, top_y, r2_buf, col_r2, col_shadow, scale);
+                            }
+                        }
+
+                        DWORD dwWritten = 0;
+                        if (!WriteFile(g_hPipeVideo, g_rec_bgra_buf, (DWORD)req_bytes, &dwWritten, NULL)) {
+                            LogRec("WriteFile video failed err=%lu", GetLastError());
+                            StopNativeRecording("WRITE_VIDEO_FAIL");
+                        } else {
+                            vid_ok = 1;
+                        }
+                    }
+                }
+            }
+
+            // 2. 音訊極速循序寫入 temp_a.wav (每秒僅 176 KB，極致輕量無死鎖)
+            if (vid_ok && g_hAudioFile != INVALID_HANDLE_VALUE) {
+                const short* pSound = *(const short**)GetHostPtrByVa(0x03172bb8);
+                int soundLen = *(int*)GetHostPtrByVa(0x03121af8);
+                DWORD sz = (DWORD)(soundLen * 4);
+                // 【金鐘罩防護】：驗證音訊緩衝區可讀性，防止野指標崩潰
+                if (pSound && soundLen > 0 && soundLen < 8192 && !IsBadReadPtr(pSound, sz)) {
+                    DWORD dwWritten = 0;
+                    WriteFile(g_hAudioFile, pSound, sz, &dwWritten, NULL);
+                    g_rec_audio_bytes += dwWritten;
+                } else {
+                    static short s_silence[735 * 2] = {0};
+                    DWORD dwWritten = 0;
+                    WriteFile(g_hAudioFile, s_silence, sizeof(s_silence), &dwWritten, NULL);
+                    g_rec_audio_bytes += sizeof(s_silence);
+                }
+            }
+
+            g_rec_attempts++;
+            if (vid_ok) g_rec_frames_written++;
+            if (g_rec_attempts <= 5 || g_rec_attempts % 60 == 0) {
+                LogRec("DIAG attempt=%d ok=%d written=%d | pipeV=%d w=%d h=%d bpp=%d pDraw=%p | cur_f=%d state=%d",
+                    g_rec_attempts, vid_ok, g_rec_frames_written, (int)g_bPipeVConnected, d_w, d_h, d_bpp, d_pDraw, cur_f, state_c);
+            }
+            if (g_bNativeRecording && g_rec_attempts >= 300 && g_rec_frames_written == 0) {
+                LogRec("ABORT: 300 attempts but 0 video frames written (pipeV=%d pDraw=%p bpp=%d). Video source unavailable.",
+                    (int)g_bPipeVConnected, d_pDraw, d_bpp);
+                StopNativeRecording("NO_VIDEO_DATA");
+            }
+            if (g_bNativeRecording && vid_ok) {
+
+                if (g_rec_frames_written <= 5 || g_rec_frames_written % 60 == 0) {
+                    int quota = g_rec_is_full ? 0 : (g_rec_end_frame - g_rec_start_frame);
+                    int dbg_sl = *(int*)GetHostPtrByVa(0x03121af8);
+                    const void* dbg_ps = *(const void**)GetHostPtrByVa(0x03172bb8);
+                    LogRec("Recording in progress: written=%d / %d quota (cur_f=%d, audio_bytes=%lu, soundLen=%d, pSound=%p)",
+                        g_rec_frames_written, quota, cur_f, g_rec_audio_bytes, dbg_sl, dbg_ps);
+                }
+
+                if (g_rec_is_full) {
+                    if (is_eof == 1 && cur_f >= max_f - 2 && g_rec_frames_written >= 30) {
+                        LogRec("Full match reached EOF, finalizing recording (written=%d).", g_rec_frames_written);
+                        StopNativeRecording("FULL_EOF");
+                    }
+                } else {
+                    int target_quota = g_rec_end_frame - g_rec_start_frame;
+                    if (target_quota <= 0) target_quota = 600;
+
+                    if (g_rec_frames_written >= target_quota) {
+                        LogRec("Clip fulfilled absolute frame quota (%d >= %d), finalizing recording.",
+                            g_rec_frames_written, target_quota);
+                        StopNativeRecording("CLIP_END");
+                    }
+                }
+            }
+        }
+    }
+
+    // 正常播放每 15 幀寫入一次；快進/探底狂奔 (state_c == 2) 時每 60 幀 (約 0.1 秒) 寫入一次；
+    // 若狀態改變 (如撞尾/暫停/啟動快進) 或收到 force_fl 則當幀 100% 立即落盤！
+    int write_interval = (state_c == 2) ? 60 : 15;
+    static int s_last_state_c = -1;
+    static int s_last_is_eof  = -1;
+    int state_changed = (state_c != s_last_state_c) || (is_eof != s_last_is_eof);
+    s_last_state_c = state_c;
+    s_last_is_eof  = is_eof;
+
+    if (force_fl || state_changed || (cur_f % write_interval == 0) || g_rec_state_dirty || (g_bNativeRecording && g_rec_frames_written % 5 == 0)) {
+        g_rec_state_dirty = 0;
+        static char st_path[MAX_PATH] = {0};
+        if (!st_path[0]) {
+            snprintf(st_path, sizeof(st_path), "%sscripts\\ipc_state.txt", g_module_dir);
+        }
+
+        FILE* fp = fopen(st_path, "w");
+        if (fp) {
+            fprintf(fp, "%d %d %d %d %d %d %d\n", cur_f, max_f, is_eof, state_c, target_f, g_bNativeRecording, g_rec_frames_written);
+            fclose(fp);
+        }
     }
     return 0;
 }
+
+// ============================================================================
+// 進程內原生音訊控制器 (In-Process Native Audio Session Controller)
+// 100% 零跨進程枚舉、零驅動相依性、零註冊表殘留，標準 COM DirectSound/WASAPI 控制
+// ============================================================================
+#define CLSCTX_INPROC_SERVER 1
+
+static const GUID CLSID_MMDeviceEnumerator_Val = {
+    0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}
+};
+static const GUID IID_IMMDeviceEnumerator_Val = {
+    0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}
+};
+static const GUID IID_IAudioSessionManager_Val = {
+    0xBFA971F1, 0x4D5E, 0x40BB, {0x93, 0x5E, 0x96, 0x70, 0x39, 0xBF, 0xBE, 0xE4}
+};
+
+typedef enum { eRender_Aud = 0, eCapture_Aud = 1, eAll_Aud = 2 } EDataFlow_Aud;
+typedef enum { eConsole_Aud = 0, eMultimedia_Aud = 1, eCommunications_Aud = 2 } ERole_Aud;
+
+typedef struct IMMDeviceEnumerator_AudVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *This, const GUID *riid, void **ppvObject);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(void *This);
+    ULONG   (STDMETHODCALLTYPE *Release)(void *This);
+    HRESULT (STDMETHODCALLTYPE *EnumAudioEndpoints)(void *This, EDataFlow_Aud dataFlow, DWORD dwStateMask, void **ppDevices);
+    HRESULT (STDMETHODCALLTYPE *GetDefaultAudioEndpoint)(void *This, EDataFlow_Aud dataFlow, ERole_Aud role, void **ppEndpoint);
+} IMMDeviceEnumerator_AudVtbl;
+
+typedef struct IMMDevice_AudVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *This, const GUID *riid, void **ppvObject);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(void *This);
+    ULONG   (STDMETHODCALLTYPE *Release)(void *This);
+    HRESULT (STDMETHODCALLTYPE *Activate)(void *This, const GUID *iid, DWORD dwClsCtx, void *pActivationParams, void **ppInterface);
+} IMMDevice_AudVtbl;
+
+typedef struct IAudioSessionManager_AudVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *This, const GUID *riid, void **ppvObject);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(void *This);
+    ULONG   (STDMETHODCALLTYPE *Release)(void *This);
+    HRESULT (STDMETHODCALLTYPE *GetAudioSessionControl)(void *This, const GUID *AudioSessionGuid, DWORD StreamFlags, void **AudioSessionControl);
+    HRESULT (STDMETHODCALLTYPE *GetSimpleAudioVolume)(void *This, const GUID *AudioSessionGuid, DWORD StreamFlags, void **AudioVolume);
+} IAudioSessionManager_AudVtbl;
+
+typedef struct ISimpleAudioVolume_AudVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *This, const GUID *riid, void **ppvObject);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(void *This);
+    ULONG   (STDMETHODCALLTYPE *Release)(void *This);
+    HRESULT (STDMETHODCALLTYPE *SetMasterVolume)(void *This, float fLevel, const GUID *EventContext);
+    HRESULT (STDMETHODCALLTYPE *GetMasterVolume)(void *This, float *pfLevel);
+    HRESULT (STDMETHODCALLTYPE *SetMute)(void *This, const BOOL bMute, const GUID *EventContext);
+    HRESULT (STDMETHODCALLTYPE *GetMute)(void *This, BOOL *pbMute);
+} ISimpleAudioVolume_AudVtbl;
+
+typedef struct { struct IMMDeviceEnumerator_AudVtbl *lpVtbl; } IAudMMDeviceEnumerator;
+typedef struct { struct IMMDevice_AudVtbl *lpVtbl; } IAudMMDevice;
+typedef struct { struct IAudioSessionManager_AudVtbl *lpVtbl; } IAudAudioSessionManager;
+typedef struct { struct ISimpleAudioVolume_AudVtbl *lpVtbl; } IAudSimpleAudioVolume;
+
+typedef HRESULT (WINAPI *pfn_AudCoInitialize)(LPVOID);
+typedef void    (WINAPI *pfn_AudCoUninitialize)(void);
+typedef HRESULT (WINAPI *pfn_AudCoCreateInstance)(const GUID*, void*, DWORD, const GUID*, void**);
+
+static IAudSimpleAudioVolume* s_pSimpleAudioVolume = NULL;
+static BOOL s_bAudioComInited = FALSE;
+static BOOL s_bCurrentMuteState = FALSE;
+
+static IAudSimpleAudioVolume* GetProcessAudioVolume(void) {
+    if (s_pSimpleAudioVolume) return s_pSimpleAudioVolume;
+
+    HMODULE hOle = GetModuleHandleA("ole32.dll");
+    if (!hOle) hOle = LoadLibraryA("ole32.dll");
+    if (!hOle) return NULL;
+
+    pfn_AudCoInitialize pCoInit = (pfn_AudCoInitialize)GetProcAddress(hOle, "CoInitialize");
+    pfn_AudCoCreateInstance pCoCreate = (pfn_AudCoCreateInstance)GetProcAddress(hOle, "CoCreateInstance");
+    if (!pCoCreate) return NULL;
+
+    if (!s_bAudioComInited && pCoInit) {
+        pCoInit(NULL);
+        s_bAudioComInited = TRUE;
+    }
+
+    IAudMMDeviceEnumerator* pEnum = NULL;
+    HRESULT hr = pCoCreate(&CLSID_MMDeviceEnumerator_Val, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_IMMDeviceEnumerator_Val, (void**)&pEnum);
+    if (SUCCEEDED(hr) && pEnum) {
+        IAudMMDevice* pDevice = NULL;
+        hr = pEnum->lpVtbl->GetDefaultAudioEndpoint(pEnum, eRender_Aud, eConsole_Aud, (void**)&pDevice);
+        if (SUCCEEDED(hr) && pDevice) {
+            IAudAudioSessionManager* pMgr = NULL;
+            hr = pDevice->lpVtbl->Activate(pDevice, &IID_IAudioSessionManager_Val, CLSCTX_INPROC_SERVER, NULL, (void**)&pMgr);
+            if (SUCCEEDED(hr) && pMgr) {
+                IAudSimpleAudioVolume* pVol = NULL;
+                hr = pMgr->lpVtbl->GetSimpleAudioVolume(pMgr, NULL, 0, (void**)&pVol);
+                if (SUCCEEDED(hr) && pVol) {
+                    s_pSimpleAudioVolume = pVol;
+                }
+                pMgr->lpVtbl->Release(pMgr);
+            }
+            pDevice->lpVtbl->Release(pDevice);
+        }
+        pEnum->lpVtbl->Release(pEnum);
+    }
+    return s_pSimpleAudioVolume;
+}
+
+static void SetProcessInternalMute(BOOL bMute) {
+    s_bCurrentMuteState = bMute;
+    IAudSimpleAudioVolume* pVol = GetProcessAudioVolume();
+    if (pVol) {
+        pVol->lpVtbl->SetMute(pVol, bMute, NULL);
+    }
+}
+
+static void CleanupInternalAudio(void) {
+    if (s_pSimpleAudioVolume) {
+        s_pSimpleAudioVolume->lpVtbl->SetMute(s_pSimpleAudioVolume, FALSE, NULL);
+        s_pSimpleAudioVolume->lpVtbl->Release(s_pSimpleAudioVolume);
+        s_pSimpleAudioVolume = NULL;
+    }
+    if (s_bAudioComInited) {
+        HMODULE hOle = GetModuleHandleA("ole32.dll");
+        if (hOle) {
+            pfn_AudCoUninitialize pCoUninit = (pfn_AudCoUninitialize)GetProcAddress(hOle, "CoUninitialize");
+            if (pCoUninit) pCoUninit();
+        }
+        s_bAudioComInited = FALSE;
+    }
+}
+
+__declspec(dllexport) int lua_set_audio_mute(void* L) {
+    if (!p_lua_tointeger) InitRealDll();
+    if (p_lua_tointeger && L) {
+        int mute = (int)p_lua_tointeger(L, 1);
+        SetProcessInternalMute(mute ? TRUE : FALSE);
+    }
+    return 0;
+}
+
 
 
 // ----------------------------------------------------------------------------
@@ -2392,8 +4088,13 @@ __declspec(dllexport) int lua_get_scores(void* L) {
     if (g_exe_base && g_exe_whitelist_matched) {
         int* pScoreP1 = (int*)(g_exe_base + 0x02D83210);
         int* pScoreP2 = (int*)(g_exe_base + 0x02D83214);
-
-        if (!IsBadReadPtr(pScoreP1, sizeof(int)) && !IsBadReadPtr(pScoreP2, sizeof(int))) {
+        static int s_score_ptrs_ok = 0;
+        if (!s_score_ptrs_ok) {
+            if (!IsBadReadPtr(pScoreP1, sizeof(int)) && !IsBadReadPtr(pScoreP2, sizeof(int))) {
+                s_score_ptrs_ok = 1;
+            }
+        }
+        if (s_score_ptrs_ok) {
             p1 = *pScoreP1;
             p2 = *pScoreP2;
         }
@@ -2503,6 +4204,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         g_main_tid = GetCurrentThreadId();
         InitModuleDir(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
+        StopNativeRecording("DLL_DETACH"); CleanupInternalAudio(); if (g_rec_bgra_buf) { free(g_rec_bgra_buf); g_rec_bgra_buf = NULL; }
         if (lpvReserved == NULL && hReal) {
             FreeLibrary(hReal);
             hReal = NULL;
