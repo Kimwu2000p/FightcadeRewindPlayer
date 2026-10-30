@@ -127,6 +127,12 @@ v1.1 已深度支援並實測通過：
 
 ---
 
+## 💖 特別鳴謝 (Special Thanks)
+
+衷心感謝 **[Fightcade](https://www.fightcade.com/) 團隊** 為全球格鬥遊戲愛好者打造如此卓越的對戰平台與聯賽生態。沒有 Fightcade 卓越的 GGPO 回滾網路架構與龐大的社群基礎，就沒有本專案的誕生。向所有為復古格鬥遊戲文化傳承默默付出的開發者致敬！
+
+---
+
 ## 📄 授權條款 (License)
 
 本專案採用 [MIT License](LICENSE) 條款開源。  

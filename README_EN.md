@@ -126,6 +126,12 @@ In-process WASAPI mute silences fast-forward noise and unmutes on 1x playback. I
 
 ---
 
+## 💖 Special Thanks
+
+Heartfelt thanks to the **[Fightcade](https://www.fightcade.com/) Team** for creating such an extraordinary matchmaking platform and rollback netplay ecosystem for retro fighting game enthusiasts worldwide. Without Fightcade's remarkable GGPO architecture and vibrant community, this project would not have been possible. Huge respect to the developers who keep the classic fighting game spirit alive!
+
+---
+
 ## 📄 License
 
 This project is open-sourced under the [MIT License](LICENSE).  
