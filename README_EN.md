@@ -67,6 +67,33 @@ Export any highlight clip (custom start/end seconds) or full match to high-quali
 
 ---
 
+## 🚧 v1.2 PLUS Roadmap Preview: Esports Input Visualizer & Forensic Diagnosis
+
+> [!NOTE]
+> The following flagship features are under active development in **FightcadeRewindPlayer v1.2 PLUS**, designed specifically for tournament organizers, pro commentators, and hardcore competitive analysis!
+
+<p align="center">
+  <img src="assets/v1.2_preview_forensic.jpg" alt="Input Forensic Diagnosis Report" width="48%" />
+  <img src="assets/v1.2_preview_stick_hud.jpg" alt="Arcade Stick & Button Visualizer" width="48%" />
+</p>
+<p align="center">
+  <img src="assets/v1.2_preview_vertical_osd.jpg" alt="Vertical Input History OSD" width="48%" />
+  <img src="assets/v1.2_preview_move_overlay.jpg" alt="Special Move Command Display" width="48%" />
+</p>
+
+### 🔮 4 Flagship Esports Innovations:
+1. 🕵️ **Esports Input Forensic Diagnosis**:
+   - Advanced Gaussian distribution physiological modeling to distinguish **Pure Manual Human Input vs. Macro Scripts, Turbo Autobind, and Illegal SOCD Jump Rolls**.
+   - Automatically infers physical controller hardware (Traditional 4-button arcade stick vs. modern custom pad with bound keys) with detailed referee confidence metrics.
+2. 🕹️ **Real-Time Arcade Stick & Button Visualizer**:
+   - Direct-rendered live arcade ball-top stick and ABCD button states directly in the broadcast scene.
+3. 📜 **Vertical Key History OSD (Dual-Side Rolling Stream)**:
+   - Rolling frame-hold counters and directional keys on both flanks (e.g. `10 ➡`, `4 [H]`, `13 ➡ [B]`), ideal for spacing and link frame analysis.
+4. ⚡ **Special Move Graphic Command Detection**:
+   - Real-time command buffer parsing with graphic overlays (`➡ ⬇ ↘ ➡ + P`), perfect for stream commentary and replay breakdowns.
+
+---
+
 ## 📦 Placement & How to Get FFmpeg (Free)
 
 The MP4 recording feature is powered by the open-source **FFmpeg** media engine (not needed if only watching and rewinding):

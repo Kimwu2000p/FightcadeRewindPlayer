@@ -67,6 +67,33 @@
 
 ---
 
+## 🚧 v1.2 PLUS 旗艦功能預覽：電競輸入視覺化與操作取證系統 (Roadmap Preview)
+
+> [!NOTE]
+> 以下功能為 **FightcadeRewindPlayer v1.2 PLUS** 核心研發中的下一代電競級功能，專為格鬥賽事主辦、專業解說實況與硬核覆盤玩家打造！
+
+<p align="center">
+  <img src="assets/v1.2_preview_forensic.jpg" alt="操作取證診斷報告" width="48%" />
+  <img src="assets/v1.2_preview_stick_hud.jpg" alt="街機大搖面板按鍵實時投影" width="48%" />
+</p>
+<p align="center">
+  <img src="assets/v1.2_preview_vertical_osd.jpg" alt="雙側縱向指令串流 OSD" width="48%" />
+  <img src="assets/v1.2_preview_move_overlay.jpg" alt="必殺技招式判定展示" width="48%" />
+</p>
+
+### 🔮 四大電競級革新亮點：
+1. 🕵️ **電競級操作取證診斷報告 (Forensic Diagnosis)**：
+   - 結合高斯分佈生理學分析，精準辨識**純手動操作 vs 一鍵宏 (Macro)、連發 (Turbo)、SOCD 違規跳躍**。
+   - 智慧反推選手使用的硬體類型（原廠 4 鍵街機大搖、自訂擴充 5 鍵手把、或按鍵組合映射），提供完整的仲裁信任度指數與可疑度報告。
+2. 🕹️ **街機大搖與 ABCD 按鍵即時動態投影 (Arcade Stick & Button Visualizer)**：
+   - 遊戲畫面底層直通繪製街機搖桿與紅藍黃綠按鍵，即時捕捉選手搖桿推向與按鍵輕重打擊。
+3. 📜 **專業雙側縱向格鬥指令串流 (Vertical Input History OSD)**：
+   - 左右兩側即時滾動 1P / 2P 幀數持時與方向鍵（如 `10 ➡`, `4 [H]`, `13 ➡ [B]`），覆盤立回、目押與確反破綻一目了然。
+4. ⚡ **必殺技圖形化招式辨識與判定展示 (Special Move Input Display)**：
+   - 重播時即時辨識連續指令並疊加如 `➡ ⬇ ↘ ➡ + P` 之直觀招式判定符號，極致輔助賽事解說與新手教學。
+
+---
+
 ## 📦 放置位置與 FFmpeg 免費取得方式 (FFmpeg Setup)
 
 本播放器的「MP4 影片轉存」功能由開源的 **FFmpeg** 驅動（若僅觀看與倒帶回放，無需安裝 FFmpeg）：
