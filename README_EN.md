@@ -8,6 +8,10 @@ Powered by a lightweight DLL Proxy Hook (`ggponet.dll`), Direct Named Pipe video
 
 ---
 
+<p align="center">
+  <img src="assets/ui_preview_v1.1.1.png" alt="FightcadeRewindPlayer v1.1.1 UI Preview" width="700" />
+</p>
+
 ## 🚀 Quick Start
 
 ### General Player Setup:

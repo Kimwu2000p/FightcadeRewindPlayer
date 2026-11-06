@@ -8,6 +8,10 @@
 
 ---
 
+<p align="center">
+  <img src="assets/ui_preview_v1.1.1.png" alt="FightcadeRewindPlayer v1.1.1 介面預覽" width="700" />
+</p>
+
 ## 🚀 快速啟動步驟 (Quick Start)
 
 ### 一般玩家使用方式：
