@@ -9,7 +9,8 @@
 ---
 
 <p align="center">
-  <img src="assets/ui_preview_v1.1.1.png" alt="FightcadeRewindPlayer v1.1.1 介面預覽" width="700" />
+  <img src="assets/ui_preview_v1.1.1.png" alt="FightcadeRewindPlayer v1.1.1 繁體中文主控台" width="48%" />
+  <img src="assets/ui_preview_studio.png" alt="FightcadeRewindPlayer v1.1.1 展開 MP4 錄影工坊 (English UI)" width="48%" />
 </p>
 
 ## 🚀 快速啟動步驟 (Quick Start)
